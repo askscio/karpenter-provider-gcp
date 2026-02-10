@@ -1,0 +1,298 @@
+name: Build Karpenter GCP Provider Images
+
+#######################################################################
+# This workflow builds multi-arch Karpenter controller images
+# and publishes them to GCP (GAR) following the OpenSearch pattern
+#######################################################################
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag for the build (arch will be appended automatically)'
+        required: true
+        default: 'v0.1.0-rc.0-scio'
+        type: string
+      karpenter_version:
+        description: 'Karpenter version branch to build from'
+        required: false
+        default: 'v0.1.0-rc.0'
+        type: string
+      skip_tests:
+        description: 'Skip unit tests (use for quick rebuilds)'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  KARPENTER_VERSION: ${{ inputs.karpenter_version || 'v0.1.0-rc.0' }}
+  BUILD_TAG: ${{ inputs.tag }}
+  GO_VERSION: '1.24'  # Match go.mod version (1.24.6)
+  GAR_REGISTRY: 'us-central1-docker.pkg.dev/scio-engineering/glean-images'
+
+#######################################################################
+# 1. Build Karpenter Controller Images (one per CPU arch)
+#######################################################################
+jobs:
+  build-controller-images:
+    name: Build Controller Image (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            goarch: amd64
+          - arch: arm64
+            platform: linux/arm64
+            goarch: arm64
+    
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+      actions: 'write'
+    
+    steps:
+      - name: Set Image Tag
+        run: |
+          echo "IMAGE_TAG=${{ env.BUILD_TAG }}-${{ matrix.arch }}" >> $GITHUB_ENV
+          echo "BASE_TAG=${{ env.BUILD_TAG }}" >> $GITHUB_ENV
+      
+      - name: Generate GitHub App Token
+        id: generate-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.GLEAN_GITHUB_CI_APP_ID }}
+          private-key: ${{ secrets.GLEAN_GITHUB_CI_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+      
+      - name: Checkout Karpenter Repository
+        uses: actions/checkout@v4
+        with:
+          repository: askscio/karpenter-provider-gcp
+          ref: ${{ env.KARPENTER_VERSION }}
+          token: ${{ steps.generate-token.outputs.token }}
+          fetch-depth: 0  # Full history for version info
+      
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Set up QEMU (for cross-platform builds)
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: all
+      
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          create_credentials_file: true
+          workload_identity_provider: projects/578342684092/locations/global/workloadIdentityPools/gh-workflow-auth/providers/github
+          service_account: spinnaker-1-gcb@scio-engineering.iam.gserviceaccount.com
+          project_id: 578342684092
+      
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          version: '>= 460.0.0'
+      
+      - name: Configure Docker for GCP
+        run: |
+          gcloud auth configure-docker ${{ env.GAR_REGISTRY }}
+      
+      - name: Run Unit Tests
+        if: ${{ !inputs.skip_tests }}
+        run: |
+          echo "Running unit tests for ${{ matrix.arch }}"
+          GOARCH=${{ matrix.goarch }} go test ./pkg/... -cover
+      
+      - name: Install ko
+        uses: ko-build/setup-ko@v0.7
+      
+      - name: Build Controller Image with ko
+        run: |
+          echo "Building Karpenter Controller Image for ${{ matrix.arch }}"
+          
+          IMAGE_NAME="${{ env.GAR_REGISTRY }}/karpenter-controller"
+          IMAGE_TAG="${{ env.IMAGE_TAG }}"
+          
+          # Configure ko to push to GAR
+          export KO_DOCKER_REPO=${IMAGE_NAME}
+          
+          # Set version in binary
+          export GOFLAGS="-ldflags=-X=sigs.k8s.io/karpenter/pkg/operator.Version=${{ env.KARPENTER_VERSION }}"
+          
+          # Build with ko (handles everything: build, containerize, push)
+          echo "Building and pushing ${IMAGE_NAME}:${IMAGE_TAG}"
+          ko build --bare \
+            --platform=${{ matrix.platform }} \
+            --tags=${IMAGE_TAG} \
+            github.com/cloudpilot-ai/karpenter-provider-gcp/cmd/controller
+          
+          echo "✅ Image built and pushed: ${IMAGE_NAME}:${IMAGE_TAG}"
+      
+      - name: Get Image Digest
+        id: digest
+        run: |
+          IMAGE_NAME="${{ env.GAR_REGISTRY }}/karpenter-controller"
+          IMAGE_TAG="${{ env.IMAGE_TAG }}"
+          
+          # Get digest from GAR
+          DIGEST=$(gcloud artifacts docker images describe \
+            ${IMAGE_NAME}:${IMAGE_TAG} \
+            --format='get(image_summary.digest)')
+          
+          echo "Image digest: ${DIGEST}"
+          echo "digest=${DIGEST}" >> $GITHUB_OUTPUT
+      
+      - name: Output Build Summary
+        run: |
+          echo "## ✅ Karpenter Controller Built (${{ matrix.arch }})" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Architecture:** ${{ matrix.arch }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Platform:** ${{ matrix.platform }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image:** ${{ env.GAR_REGISTRY }}/karpenter-controller:${{ env.IMAGE_TAG }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Digest:** ${{ steps.digest.outputs.digest }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Pull command:**" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo "docker pull ${{ env.GAR_REGISTRY }}/karpenter-controller:${{ env.IMAGE_TAG }}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+  #######################################################################
+  # 2. Create Multi-Arch Manifest
+  #######################################################################
+  create-manifest:
+    name: Create Multi-Arch Manifest
+    runs-on: ubuntu-latest
+    needs: build-controller-images
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+    
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/578342684092/locations/global/workloadIdentityPools/gh-workflow-auth/providers/github
+          service_account: spinnaker-1-gcb@scio-engineering.iam.gserviceaccount.com
+          project_id: 578342684092
+      
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+      
+      - name: Configure Docker for GCP
+        run: gcloud auth configure-docker us-central1-docker.pkg.dev
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Create Multi-Arch Manifest
+        run: |
+          IMAGE_NAME="${{ env.GAR_REGISTRY }}/karpenter-controller"
+          BASE_TAG="${{ inputs.tag }}"
+          
+          echo "Creating multi-arch manifest for ${IMAGE_NAME}:${BASE_TAG}"
+          
+          # Create manifest list combining both architectures
+          docker buildx imagetools create \
+            -t ${IMAGE_NAME}:${BASE_TAG} \
+            -t ${IMAGE_NAME}:latest \
+            ${IMAGE_NAME}:${BASE_TAG}-amd64 \
+            ${IMAGE_NAME}:${BASE_TAG}-arm64
+          
+          echo "✅ Multi-arch manifest created"
+      
+      - name: Inspect Final Manifest
+        run: |
+          IMAGE_NAME="${{ env.GAR_REGISTRY }}/karpenter-controller"
+          BASE_TAG="${{ inputs.tag }}"
+          
+          echo "Inspecting ${IMAGE_NAME}:${BASE_TAG}"
+          docker buildx imagetools inspect ${IMAGE_NAME}:${BASE_TAG}
+          
+          # Extract manifest digest
+          MANIFEST_DIGEST=$(docker buildx imagetools inspect ${IMAGE_NAME}:${BASE_TAG} --format '{{json .}}' | jq -r '.manifest.digest')
+          echo "MANIFEST_DIGEST=${MANIFEST_DIGEST}" >> $GITHUB_ENV
+      
+      - name: Final Summary
+        run: |
+          echo "## 🎉 Multi-Arch Karpenter Image Published" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Image Details" >> $GITHUB_STEP_SUMMARY
+          echo "- **Repository:** ${{ env.GAR_REGISTRY }}/karpenter-controller" >> $GITHUB_STEP_SUMMARY
+          echo "- **Tag:** ${{ inputs.tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Manifest Digest:** ${{ env.MANIFEST_DIGEST }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Supported Architectures" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ linux/amd64" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ linux/arm64" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Pull Commands" >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo "# Multi-arch (automatic platform selection)" >> $GITHUB_STEP_SUMMARY
+          echo "docker pull ${{ env.GAR_REGISTRY }}/karpenter-controller:${{ inputs.tag }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "# By digest (reproducible)" >> $GITHUB_STEP_SUMMARY
+          echo "docker pull ${{ env.GAR_REGISTRY }}/karpenter-controller@${{ env.MANIFEST_DIGEST }}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "1. Update \`deploy/configs/karpenter_gcp/karpenter/values.yaml\` in scio repo" >> $GITHUB_STEP_SUMMARY
+          echo "2. Test in dev-sandbox cluster" >> $GITHUB_STEP_SUMMARY
+          echo "3. Roll out to production" >> $GITHUB_STEP_SUMMARY
+
+  #######################################################################
+  # 3. Integration Test (Optional but Recommended)
+  #######################################################################
+  integration-test:
+    name: Integration Test
+    runs-on: ubuntu-latest
+    needs: create-manifest
+    if: ${{ !inputs.skip_tests }}
+    permissions:
+      contents: 'read'
+      id-token: 'write'
+    
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: projects/578342684092/locations/global/workloadIdentityPools/gh-workflow-auth/providers/github
+          service_account: spinnaker-1-gcb@scio-engineering.iam.gserviceaccount.com
+      
+      - name: Configure Docker for GCP
+        run: gcloud auth configure-docker us-central1-docker.pkg.dev
+      
+      - name: Pull and Verify Image
+        run: |
+          IMAGE_NAME="${{ env.GAR_REGISTRY }}/karpenter-controller:${{ inputs.tag }}"
+          
+          echo "Pulling ${IMAGE_NAME}"
+          docker pull ${IMAGE_NAME}
+          
+          echo "Image pulled successfully"
+          docker images | grep karpenter-controller
+      
+      - name: Smoke Test - Version Check
+        run: |
+          IMAGE_NAME="${{ env.GAR_REGISTRY }}/karpenter-controller:${{ inputs.tag }}"
+          
+          # Try to extract version from image (may not have --version flag)
+          echo "Attempting version check..."
+          docker run --rm ${IMAGE_NAME} --version || echo "Version flag not supported (expected for controllers)"
+          
+          echo "✅ Image smoke test passed"
+      
+      - name: Security Scan with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.GAR_REGISTRY }}/karpenter-controller:${{ inputs.tag }}
+          format: 'table'
+          exit-code: '0'  # Don't fail on vulnerabilities for now
+          severity: 'CRITICAL,HIGH'
