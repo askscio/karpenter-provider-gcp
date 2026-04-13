@@ -63,7 +63,15 @@ const (
 
 	KarpenterUbuntuNodePoolTemplate          = "karpenter-ubuntu"
 	KarpenterUbuntuNodePoolTemplateImageType = "UBUNTU_CONTAINERD"
+
+	KarpenterCOSARM64NodePoolTemplate    = "karpenter-cos-arm64"
+	KarpenterUbuntuARM64NodePoolTemplate = "karpenter-ubuntu-arm64"
 )
+
+// arm64MachineType is used as the sentinel machine type when creating ARM64
+// node pool templates. c4a-standard-1 has the broadest regional availability
+// among Arm families.
+const arm64MachineType = "c4a-standard-1"
 
 func NewDefaultProvider(ctx context.Context, kubeClient client.Client, computeService *compute.Service,
 	containerService *container.Service, versionProvider version.Provider,
@@ -122,35 +130,41 @@ func resolveZones(ctx context.Context, computeService *compute.Service, projectI
 
 // creating both default nodepool templates could be run concurrently
 func (p *DefaultProvider) Create(ctx context.Context) error {
-	if err := p.ensureKarpenterNodePoolTemplate(ctx, KarpenterDefaultNodePoolTemplateImageType, KarpenterDefaultNodePoolTemplate, p.defaultServiceAccount); err != nil {
+	logger := log.FromContext(ctx)
+
+	if err := p.ensureKarpenterNodePoolTemplate(ctx, KarpenterDefaultNodePoolTemplateImageType, KarpenterDefaultNodePoolTemplate, p.defaultServiceAccount, ""); err != nil {
 		return err
 	}
 
-	if err := p.ensureKarpenterNodePoolTemplate(ctx, KarpenterUbuntuNodePoolTemplateImageType, KarpenterUbuntuNodePoolTemplate, p.defaultServiceAccount); err != nil {
+	if err := p.ensureKarpenterNodePoolTemplate(ctx, KarpenterUbuntuNodePoolTemplateImageType, KarpenterUbuntuNodePoolTemplate, p.defaultServiceAccount, ""); err != nil {
 		return err
+	}
+
+	// ARM64 templates are best-effort: if the region doesn't support ARM machine types,
+	// we log a warning and continue. Workloads requiring arm64 will fail at scheduling time.
+	if err := p.ensureKarpenterNodePoolTemplate(ctx, KarpenterDefaultNodePoolTemplateImageType, KarpenterCOSARM64NodePoolTemplate, p.defaultServiceAccount, arm64MachineType); err != nil {
+		logger.Info("failed to create ARM64 COS node pool template (best-effort)", "error", err)
+	}
+
+	if err := p.ensureKarpenterNodePoolTemplate(ctx, KarpenterUbuntuNodePoolTemplateImageType, KarpenterUbuntuARM64NodePoolTemplate, p.defaultServiceAccount, arm64MachineType); err != nil {
+		logger.Info("failed to create ARM64 Ubuntu node pool template (best-effort)", "error", err)
 	}
 
 	return nil
 }
 
-func (p *DefaultProvider) ensureKarpenterNodePoolTemplate(ctx context.Context, imageType, nodePoolName, serviceAccount string) error {
+func (p *DefaultProvider) ensureKarpenterNodePoolTemplate(ctx context.Context, imageType, nodePoolName, serviceAccount, machineType string) error {
 	logger := log.FromContext(ctx)
 
-	// adding simple validation, because previous code was failing
-	// here and no reasonable log was printed out
 	if p.ClusterInfo.Name == "" {
 		return fmt.Errorf("clusterName is required but was empty")
-	}
-	if len(p.ClusterInfo.Zones) == 0 {
-		return fmt.Errorf("no zones provided for node pool %s", nodePoolName)
 	}
 
 	logger.Info("ensuring node pool template exists",
 		"projectID", p.ClusterInfo.ProjectID,
 		"region", p.ClusterInfo.Region,
 		"name", p.ClusterInfo.Name,
-		"nodePoolName", nodePoolName,
-		"zones", p.ClusterInfo.Zones)
+		"nodePoolName", nodePoolName)
 
 	nodePoolSelfLink := fmt.Sprintf("projects/%s/locations/%s/clusters/%s/nodePools/%s",
 		p.ClusterInfo.ProjectID, p.ClusterInfo.NodeLocation, p.ClusterInfo.Name, nodePoolName)
@@ -167,17 +181,20 @@ func (p *DefaultProvider) ensureKarpenterNodePoolTemplate(ctx context.Context, i
 		return err
 	}
 
-	// Prepare request
+	nodeConfig := &container.NodeConfig{
+		ImageType:      imageType,
+		ServiceAccount: serviceAccount,
+	}
+	if machineType != "" {
+		nodeConfig.MachineType = machineType
+	}
+
 	nodePoolOpts := &container.CreateNodePoolRequest{
 		NodePool: &container.NodePool{
 			Name:             nodePoolName,
 			Autoscaling:      &container.NodePoolAutoscaling{Enabled: false},
 			InitialNodeCount: 0,
-			Locations:        p.ClusterInfo.Zones,
-			Config: &container.NodeConfig{
-				ImageType:      imageType,
-				ServiceAccount: serviceAccount,
-			},
+			Config:           nodeConfig,
 		},
 	}
 
@@ -198,7 +215,9 @@ func (p *DefaultProvider) ensureKarpenterNodePoolTemplate(ctx context.Context, i
 }
 
 func (p *DefaultProvider) GetInstanceTemplates(ctx context.Context) (map[string]*compute.InstanceTemplate, error) {
+	logger := log.FromContext(ctx)
 	ret := map[string]*compute.InstanceTemplate{}
+
 	defaultTemplate, err := p.getInstanceTemplate(ctx, KarpenterDefaultNodePoolTemplate)
 	if err != nil {
 		return nil, err
@@ -213,6 +232,20 @@ func (p *DefaultProvider) GetInstanceTemplates(ctx context.Context) (map[string]
 	}
 	if ubuntuTemplate != nil {
 		ret[KarpenterUbuntuNodePoolTemplate] = ubuntuTemplate
+	}
+
+	// ARM64 templates are best-effort: if they don't exist (region doesn't
+	// support ARM), we simply skip them.
+	arm64Templates := []string{KarpenterCOSARM64NodePoolTemplate, KarpenterUbuntuARM64NodePoolTemplate}
+	for _, name := range arm64Templates {
+		t, err := p.getInstanceTemplate(ctx, name)
+		if err != nil {
+			logger.Info("ARM64 instance template not available (best-effort)", "name", name, "error", err)
+			continue
+		}
+		if t != nil {
+			ret[name] = t
+		}
 	}
 
 	return ret, nil
