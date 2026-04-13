@@ -171,10 +171,11 @@ func (p *DefaultProvider) Create(ctx context.Context, nodeClass *v1alpha1.GCENod
 			continue
 		}
 
-		nodePoolName := resolveNodePoolName(nodeClass.ImageFamily())
+		arch := instanceType.Requirements.Get(corev1.LabelArchStable).Any()
+		nodePoolName := resolveNodePoolName(nodeClass.ImageFamily(), arch)
 		if nodePoolName == "" {
-			log.FromContext(ctx).Error(err, "failed to resolve node pool name for image family", "imageFamily", nodeClass.ImageFamily())
-			return nil, fmt.Errorf("failed to resolve node pool name for image family %q", nodeClass.ImageFamily())
+			log.FromContext(ctx).Error(err, "failed to resolve node pool name for image family", "imageFamily", nodeClass.ImageFamily(), "arch", arch)
+			return nil, fmt.Errorf("failed to resolve node pool name for image family %q and arch %q", nodeClass.ImageFamily(), arch)
 		}
 
 		template, err := p.findTemplateByNodePoolName(ctx, nodePoolName)
@@ -330,7 +331,17 @@ func (p *DefaultProvider) selectZone(ctx context.Context, nodeClaim *karpv1.Node
 	return cheapestZone, nil
 }
 
-func resolveNodePoolName(imageFamily string) string {
+func resolveNodePoolName(imageFamily, arch string) string {
+	if arch == "arm64" {
+		switch imageFamily {
+		case v1alpha1.ImageFamilyContainerOptimizedOS:
+			return nodepooltemplate.KarpenterCOSARM64NodePoolTemplate
+		case v1alpha1.ImageFamilyUbuntu:
+			return nodepooltemplate.KarpenterUbuntuARM64NodePoolTemplate
+		}
+		return ""
+	}
+
 	switch imageFamily {
 	case v1alpha1.ImageFamilyContainerOptimizedOS:
 		return nodepooltemplate.KarpenterDefaultNodePoolTemplate
