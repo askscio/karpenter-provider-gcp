@@ -179,7 +179,7 @@ func extractGeneration(instanceTypePrefix string) string {
 
 func extractArch(instanceTypePrefix string) string {
 	// referring to https://cloud.google.com/compute/docs/instances/arm-on-compute
-	if instanceTypePrefix == "a4x" || instanceTypePrefix == "c4a" || instanceTypePrefix == "n4a" || instanceTypePrefix == "t2a" {
+	if instanceTypePrefix == "a4x" || instanceTypePrefix == "c4a" || instanceTypePrefix == "t2a" {
 		return "arm64"
 	}
 	return "amd64"
