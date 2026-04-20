@@ -2,6 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ include "karpenter.fullname" . }}
+  namespace: {{ .Release.Namespace }}
   labels:
     {{- include "karpenter.labels" . | nindent 4 }}
   {{- with .Values.additionalAnnotations }}
@@ -43,7 +44,7 @@ spec:
       {{- end }}
       containers:
         - name: karpenter
-          image: "{{ .Values.controller.image.repository }}:{{ .Values.controller.image.tag }}"
+          image: "{{ .Values.controller.image.repository }}:{{ default .Chart.AppVersion .Values.controller.image.tag }}"
           imagePullPolicy: {{ .Values.controller.image.pullPolicy }}
           env:
             - name: HEALTH_PROBE_PORT
