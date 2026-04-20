@@ -67,7 +67,7 @@ helm repo add karpenter-provider-gcp https://cloudpilot-ai.github.io/karpenter-p
 helm upgrade karpenter charts/karpenter --install \
   --namespace karpenter-system --create-namespace \
   --set "controller.settings.projectID=${PROJECT_ID}" \
-  --set "controller.settings.location=${REGION}" \
+  --set "controller.settings.clusterLocation=${REGION}" \
   --set "controller.settings.clusterName=${CLUSTER_NAME}" \
   --set "credentials.enabled=false" \
   --set "serviceAccount.annotations.iam\.gke\.io/gcp-service-account=karpenter-gsa@${PROJECT_ID}.iam.gserviceaccount.com" \
@@ -151,7 +151,7 @@ helm repo add karpenter-provider-gcp https://cloudpilot-ai.github.io/karpenter-p
 helm upgrade karpenter charts/karpenter --install \
   --namespace karpenter-system --create-namespace \
   --set "controller.settings.projectID=${PROJECT_ID}" \
-  --set "controller.settings.location=${REGION}" \
+  --set "controller.settings.clusterLocation=${REGION}" \
   --set "controller.settings.clusterName=${CLUSTER_NAME}" \
   --wait
 ```
@@ -208,7 +208,7 @@ spec:
           values: ["on-demand", "spot"]
         - key: "karpenter.k8s.gcp/instance-family"
           operator: In
-          values: ["n4-standard", "n2-standard", "e2"]
+          values: ["n4", "n2", "e2"]
         - key: "kubernetes.io/arch"
           operator: In
           values: ["amd64"]
