@@ -674,6 +674,24 @@ func (p *DefaultProvider) buildInstance(nodeClaim *karpv1.NodeClaim, nodeClass *
 	// Configure capacity provision
 	p.configureInstanceCapacityProvision(instance, capacityType)
 
+	if nodeClass.Spec.ShieldedInstanceConfig != nil {
+		cfg := nodeClass.Spec.ShieldedInstanceConfig
+		shieldedCfg := &compute.ShieldedInstanceConfig{}
+		if cfg.EnableSecureBoot != nil {
+			shieldedCfg.EnableSecureBoot = *cfg.EnableSecureBoot
+			shieldedCfg.ForceSendFields = append(shieldedCfg.ForceSendFields, "EnableSecureBoot")
+		}
+		if cfg.EnableVtpm != nil {
+			shieldedCfg.EnableVtpm = *cfg.EnableVtpm
+			shieldedCfg.ForceSendFields = append(shieldedCfg.ForceSendFields, "EnableVtpm")
+		}
+		if cfg.EnableIntegrityMonitoring != nil {
+			shieldedCfg.EnableIntegrityMonitoring = *cfg.EnableIntegrityMonitoring
+			shieldedCfg.ForceSendFields = append(shieldedCfg.ForceSendFields, "EnableIntegrityMonitoring")
+		}
+		instance.ShieldedInstanceConfig = shieldedCfg
+	}
+
 	// Configure GPU on-host maintenance to TERMINATE if:
 	// 1. GPU is attached via template (GuestAccelerators like T4/P4/V100), or
 	// 2. Machine type has built-in GPUs (e.g., A2, A3, G2 series)
