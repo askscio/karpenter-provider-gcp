@@ -74,6 +74,9 @@ type GCENodeClassSpec struct {
 	// +kubebuilder:validation:MaxItems=20
 	// +optional
 	NetworkTags []NetworkTag `json:"networkTags,omitempty"`
+	// ShieldedInstanceConfig defines the Shielded VM settings for provisioned instances.
+	// +optional
+	ShieldedInstanceConfig *ShieldedInstanceConfig `json:"shieldedInstanceConfig,omitempty"`
 }
 
 // ImageSelectorTerm defines selection logic for an image used by Karpenter to launch nodes.
@@ -213,6 +216,19 @@ type SecondaryBootDiskMode string
 // +kubebuilder:validation:MaxLength=63
 type NetworkTag string
 
+// ShieldedInstanceConfig defines the Shielded VM settings for provisioned instances.
+type ShieldedInstanceConfig struct {
+	// EnableSecureBoot defines whether the instance has Secure Boot enabled. Disabled by default.
+	// +optional
+	EnableSecureBoot *bool `json:"enableSecureBoot,omitempty"`
+	// EnableVtpm defines whether the instance has the vTPM enabled. Enabled by default.
+	// +optional
+	EnableVtpm *bool `json:"enableVtpm,omitempty"`
+	// EnableIntegrityMonitoring defines whether the instance has integrity monitoring enabled. Enabled by default.
+	// +optional
+	EnableIntegrityMonitoring *bool `json:"enableIntegrityMonitoring,omitempty"`
+}
+
 // GCENodeClass is the Schema for the GCENodeClass API
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 // +kubebuilder:resource:path=gcenodeclasses,scope=Cluster,categories=karpenter,shortName={gcenc,gcencs}
@@ -234,7 +250,7 @@ const (
 	// 1. A field changes its default value for an existing field that is already hashed
 	// 2. A field is added to the hash calculation with an already-set value
 	// 3. A field is removed from the hash calculations
-	GCENodeClassHashVersion = "v3"
+	GCENodeClassHashVersion = "v4"
 )
 
 func (in *GCENodeClass) Hash() string {
