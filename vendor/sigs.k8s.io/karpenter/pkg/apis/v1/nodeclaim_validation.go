@@ -37,6 +37,8 @@ var (
 		string(v1.NodeSelectorOpLt),
 		string(v1.NodeSelectorOpExists),
 		string(v1.NodeSelectorOpDoesNotExist),
+		string(NodeSelectorOpGte),
+		string(NodeSelectorOpLte),
 	)
 
 	SupportedReservedResources = sets.NewString(
@@ -143,7 +145,8 @@ func ValidateRequirement(ctx context.Context, requirement NodeSelectorRequiremen
 		errs = multierr.Append(errs, fmt.Errorf("key %s with operator %s must have at least minimum number of values defined in 'values' field", requirement.Key, requirement.Operator))
 	}
 
-	if requirement.Operator == v1.NodeSelectorOpGt || requirement.Operator == v1.NodeSelectorOpLt {
+	if requirement.Operator == v1.NodeSelectorOpGt || requirement.Operator == v1.NodeSelectorOpLt ||
+		requirement.Operator == NodeSelectorOpGte || requirement.Operator == NodeSelectorOpLte {
 		if len(requirement.Values) != 1 {
 			errs = multierr.Append(errs, fmt.Errorf("key %s with operator %s must have a single positive integer value", requirement.Key, requirement.Operator))
 		} else {

@@ -23,6 +23,13 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
+const (
+	// NodeSelectorOpGte is a karpenter-specific operator for greater-than-or-equal comparisons.
+	NodeSelectorOpGte v1.NodeSelectorOperator = "Gte"
+	// NodeSelectorOpLte is a karpenter-specific operator for less-than-or-equal comparisons.
+	NodeSelectorOpLte v1.NodeSelectorOperator = "Lte"
+)
+
 // NodeClaimSpec describes the desired state of the NodeClaim
 type NodeClaimSpec struct {
 	// Taints will be applied to the NodeClaim's node.
