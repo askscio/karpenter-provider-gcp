@@ -103,6 +103,8 @@ func NewOperator(ctx context.Context, operator *operator.Operator) (context.Cont
 		options.FromContext(ctx).NodePoolServiceAccount,
 		options.FromContext(ctx).ClusterLocation,
 		options.FromContext(ctx).NodeLocation,
+		options.FromContext(ctx).BootDiskKMSKey,
+		options.FromContext(ctx).EnableSecureBoot,
 	)
 	imageProvider := imagefamily.NewDefaultProvider(computeService, nodeTemplateProvider)
 	pricingProvider, err := pricing.NewDefaultProvider(ctx, region)
