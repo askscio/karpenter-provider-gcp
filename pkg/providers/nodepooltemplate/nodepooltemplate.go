@@ -55,6 +55,12 @@ type ClusterInfo struct {
 	Region          string
 	Name            string
 	Zones           []string
+	// BootDiskKMSKey encrypts the boot disk of the template node pools when set
+	// (CMEK-enforced customers).
+	BootDiskKMSKey string
+	// EnableSecureBoot turns on Shielded VM Secure Boot for the template node
+	// pools when true.
+	EnableSecureBoot bool
 }
 
 const (
@@ -75,7 +81,8 @@ const arm64MachineType = "c4a-standard-1"
 
 func NewDefaultProvider(ctx context.Context, kubeClient client.Client, computeService *compute.Service,
 	containerService *container.Service, versionProvider version.Provider,
-	clusterName, region, projectID, serviceAccount, clusterLocation, nodeLocation string) *DefaultProvider {
+	clusterName, region, projectID, serviceAccount, clusterLocation, nodeLocation, bootDiskKMSKey string,
+	enableSecureBoot bool) *DefaultProvider {
 
 	zones, err := resolveZones(ctx, computeService, projectID, region)
 	if err != nil {
@@ -90,12 +97,14 @@ func NewDefaultProvider(ctx context.Context, kubeClient client.Client, computeSe
 		versionProvider:       versionProvider,
 		defaultServiceAccount: serviceAccount,
 		ClusterInfo: ClusterInfo{
-			ProjectID:       projectID,
-			ClusterLocation: clusterLocation,
-			NodeLocation:    nodeLocation,
-			Region:          region,
-			Name:            clusterName,
-			Zones:           zones,
+			ProjectID:        projectID,
+			ClusterLocation:  clusterLocation,
+			NodeLocation:     nodeLocation,
+			Region:           region,
+			Name:             clusterName,
+			Zones:            zones,
+			BootDiskKMSKey:   bootDiskKMSKey,
+			EnableSecureBoot: enableSecureBoot,
 		},
 	}
 }
@@ -187,6 +196,15 @@ func (p *DefaultProvider) ensureKarpenterNodePoolTemplate(ctx context.Context, i
 	}
 	if machineType != "" {
 		nodeConfig.MachineType = machineType
+	}
+	if p.ClusterInfo.BootDiskKMSKey != "" {
+		nodeConfig.BootDiskKmsKey = p.ClusterInfo.BootDiskKMSKey
+	}
+	if p.ClusterInfo.EnableSecureBoot {
+		nodeConfig.ShieldedInstanceConfig = &container.ShieldedInstanceConfig{
+			EnableSecureBoot: true,
+			ForceSendFields:  []string{"EnableSecureBoot"},
+		}
 	}
 
 	nodePoolOpts := &container.CreateNodePoolRequest{

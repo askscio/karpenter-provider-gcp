@@ -42,6 +42,10 @@ const (
 	GCPAuth                           = "GOOGLE_APPLICATION_CREDENTIALS"
 	nodePoolServiceAccountEnvVarName  = "DEFAULT_NODEPOOL_SERVICE_ACCOUNT"
 	nodePoolServiceAccountFlagName    = "default-nodepool-service-account"
+	bootDiskKMSKeyEnvVarName          = "BOOT_DISK_KMS_KEY"
+	bootDiskKMSKeyFlagName            = "boot-disk-kms-key"
+	enableSecureBootEnvVarName        = "ENABLE_SECURE_BOOT"
+	enableSecureBootFlagName          = "enable-secure-boot"
 )
 
 func init() {
@@ -61,6 +65,13 @@ type Options struct {
 	GCPAuth                string
 	NodePoolServiceAccount string
 	Interruption           bool
+	// BootDiskKMSKey is the Cloud KMS key used to encrypt the boot disk of the
+	// default node pool templates. Required for CMEK-enforced customers
+	// (gcp.restrictNonCmekServices org policy).
+	BootDiskKMSKey string
+	// EnableSecureBoot enables Shielded VM Secure Boot on the default node pool
+	// templates. Required for customers enforcing a Secure Boot org policy.
+	EnableSecureBoot bool
 }
 
 func (o *Options) AddFlags(fs *coreoptions.FlagSet) {
@@ -71,6 +82,8 @@ func (o *Options) AddFlags(fs *coreoptions.FlagSet) {
 	fs.Float64Var(&o.VMMemoryOverheadPercent, vmMemoryOverheadPercentFlagName, utils.WithDefaultFloat64(vmMemoryOverheadPercentEnvVarName, 0.07), "Percentage of memory overhead for VM. If not set, the controller will use the default value 7%.")
 	fs.StringVar(&o.GCPAuth, GCPAuth, env.WithDefaultString(GCPAuth, ""), "Path to the Google Application Credentials JSON file. If not set, the controller will use the default credentials from the environment.")
 	fs.StringVar(&o.NodePoolServiceAccount, nodePoolServiceAccountFlagName, env.WithDefaultString(nodePoolServiceAccountEnvVarName, ""), "Service account to use for default node pool templates. If not set, uses <project number>-compute@developer.gserviceaccount.com")
+	fs.StringVar(&o.BootDiskKMSKey, bootDiskKMSKeyFlagName, env.WithDefaultString(bootDiskKMSKeyEnvVarName, ""), "Cloud KMS key used to encrypt the boot disk of the default node pool templates. Required for CMEK-enforced customers. Format: projects/P/locations/L/keyRings/R/cryptoKeys/K")
+	fs.BoolVar(&o.EnableSecureBoot, enableSecureBootFlagName, env.WithDefaultBool(enableSecureBootEnvVarName, false), "Enable Shielded VM Secure Boot on the default node pool templates. Required for customers enforcing a Secure Boot org policy.")
 	fs.BoolVar(&o.Interruption, gkeEnableInterruption, env.WithDefaultBool(gkeEnableInterruption, true), "Enable interruption handling.")
 }
 
