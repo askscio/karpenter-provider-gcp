@@ -245,6 +245,24 @@ func AppendSecondaryBootDisks(projectID string, nodeClass *v1alpha1.GCENodeClass
 	}
 }
 
+// AppendImageStreaming enables GKE Image Streaming (GCFS) on the launched node by
+// injecting ENABLE_GCFS into kube-env, which the COS startup scripts read to start
+// gcfsd. This is applied on the per-instance provisioning path so every Karpenter
+// node streams without depending on the template pool's gcfs config.
+func AppendImageStreaming(metadata *compute.Metadata) {
+	for _, item := range metadata.Items {
+		if item.Key != "kube-env" {
+			continue
+		}
+		kubeEnv := swag.StringValue(item.Value)
+		if strings.Contains(kubeEnv, "ENABLE_GCFS:") {
+			continue
+		}
+		lines := append(strings.Split(kubeEnv, "\n"), `ENABLE_GCFS: "true"`)
+		item.Value = swag.String(strings.Join(lines, "\n"))
+	}
+}
+
 // GetSecondaryDiskImageDeviceName returns the conventional device name for GKE
 // secondary disks from the source image.
 func GetSecondaryDiskImageDeviceName(image string) string {
