@@ -24,10 +24,12 @@ import (
 	"k8s.io/client-go/rest"
 	metricsclientset "k8s.io/metrics/pkg/client/clientset/versioned"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/events"
 
-	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/cloudprovider"
+	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/auth"
 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/controllers/csr"
+	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/controllers/gcecustommachinetype"
 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/controllers/interruption"
 	nodeclaimgc "github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/controllers/nodeclaim/garbagecollection"
 	nodeclasshash "github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/controllers/nodeclass/hash"
@@ -38,11 +40,13 @@ import (
 	controllerspricing "github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/controllers/providers/pricing"
 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/controllers/telemetry"
 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/operator/options"
+	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/providers/gke"
 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/providers/imagefamily"
 	providerinstancetype "github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/providers/instancetype"
 	providernodepooltemplate "github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/providers/nodepooltemplate"
 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/providers/offerings/unavailableofferings"
 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/providers/pricing"
+	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/providers/subnet"
 )
 
 func NewController(
@@ -55,11 +59,14 @@ func NewController(
 	imageProvider imagefamily.Provider,
 	nodePoolTemplateProvider providernodepooltemplate.Provider,
 	instanceTypeProvider providerinstancetype.Provider,
-	cloudProvider *cloudprovider.CloudProvider,
+	cloudProvider cloudprovider.CloudProvider,
 	pricingProvider pricing.Provider,
+	authOptions *auth.Credential,
+	gkeProvider gke.Provider,
+	subnetProvider subnet.Provider,
 ) []controller.Controller {
 	controllers := []controller.Controller{
-		nodeclassstatus.NewController(kubeClient, imageProvider),
+		nodeclassstatus.NewController(kubeClient, imageProvider, gkeProvider, subnetProvider),
 		nodepooltemplate.NewController(nodePoolTemplateProvider),
 		nodeclasstermination.NewController(kubeClient),
 		nodeclasshash.NewController(kubeClient),
@@ -67,6 +74,7 @@ func NewController(
 		csr.NewController(kubernetesInterface),
 		controllerspricing.NewController(pricingProvider),
 		nodeclaimgc.NewController(kubeClient, cloudProvider),
+		gcecustommachinetype.NewController(kubeClient, authOptions, gkeProvider),
 	}
 
 	if options.FromContext(ctx).Interruption {

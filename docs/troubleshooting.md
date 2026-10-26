@@ -54,7 +54,7 @@ Check `status.conditions`. The `ImagesReady` condition shows whether Karpenter c
 
 - **Invalid version format** — Pinned versions must match the family's format: `milestone.build.build.build` for ContainerOptimizedOS (e.g. `125.19216.104.126`), `vYYYYMMDD` for Ubuntu (e.g. `v20260416`). Invalid formats are rejected at admission.
 
-- **Version not found** — If `ImagesReady` shows `ImageResolutionFailed`, the pinned version does not exist in GCP. Verify availability using the `gcloud compute images list` commands in [Image management](image-management.md#finding-available-versions).
+- **Version not found** — If `ImagesReady` shows `ImageResolutionFailed`, the pinned version does not exist in GCP or its image is not `READY` yet. Verify availability using the `gcloud compute images list` commands in [Image management](image-management.md#finding-available-versions).
 
 - **Unsupported family** — Only `ContainerOptimizedOS` and `Ubuntu` are supported.
 
@@ -74,9 +74,32 @@ See [Image management](image-management.md) for version pinning options and form
 
 ## Custom machine types not discovered
 
-Karpenter discovers instance types by querying the GCP `machineTypes.aggregatedList` API, which returns only predefined catalog types. Custom machine types (e.g. `n2-custom-8-24576`) are not returned by this API and are therefore not available for scheduling via standard `karpenter.sh/instance-type` label requirements.
+Karpenter discovers most instance types by querying the GCP `machineTypes.aggregatedList` API, which returns only predefined catalog types. Custom machine types (e.g. `n2-custom-8-24576`) are never returned by this API, even when instances using that exact shape already exist in the project.
 
-This is a known limitation tracked in [GitHub issue #245](https://github.com/cloudpilot-ai/karpenter-provider-gcp/issues/245).
+To make a custom machine type schedulable, register it with a `GCECustomMachineType` object. GCP does not publish a price for custom shapes, so an on-demand and Spot price must be supplied explicitly:
+
+```yaml
+apiVersion: karpenter.k8s.gcp/v1alpha1
+kind: GCECustomMachineType
+metadata:
+  name: n2-custom-8-24576
+spec:
+  machineType: n2-custom-8-24576
+  prices:
+    onDemand: "0.40"
+    spot: "0.12"
+```
+
+A dedicated controller resolves the shape's vCPU/memory and per-zone availability via the GCP `machineTypes.get` API (which, unlike the aggregated list, does support custom shapes) and reports it on `status`:
+
+```sh
+kubectl get gcecustommachinetype n2-custom-8-24576
+kubectl describe gcecustommachinetype n2-custom-8-24576
+```
+
+Check the `Ready` condition if it doesn't show up as schedulable — `Ready=False` with reason `MachineTypeNotFound` means the named shape is invalid for its family, or the family doesn't support custom shapes in any zone available to the cluster.
+
+Once `Ready=True`, the registered shape joins the regular instance type catalog: it's schedulable via an exact `node.kubernetes.io/instance-type` requirement, or via ordinary CPU/memory requirements, exactly like a predefined type.
 
 ---
 
@@ -117,8 +140,7 @@ shieldedInstanceConfig:
 
 ```yaml
 disks:
-  - category: pd-balanced
-    sizeGiB: 60
+  - sizeGiB: 60
     boot: true
     kmsKeyName: projects/my-project/locations/us-central1/keyRings/my-ring/cryptoKeys/my-key
 ```
@@ -152,6 +174,13 @@ Karpenter detects arm64 architecture directly from the GCP Compute API. All arm6
 
 Image resolution queries GCP image catalogs directly and does not depend on the bootstrap pool. Bootstrap pool discovery and kube-env patching allow a single source pool (of any architecture) to bootstrap nodes of any OS and architecture combination. See [Bootstrap pool selection](bootstrap-pool.md) for details.
 
+For the `Ubuntu` families, each architecture is resolved independently from the image catalog: Karpenter selects the newest clean `amd64` image and the newest clean `arm64` image separately, and excludes specialized variant builds (e.g. `-tpu`, `-cgroupsv1`, `-linux64k`, `-test`). If no usable `arm64` image exists for the cluster's Kubernetes minor version, the `GCENodeClass` reports `ImagesReady=False` with reason `ImageResolutionFailed` rather than resolving an `amd64`-only image set — so an arm64 pool never appears ready while it cannot actually provision. If you see this, confirm an `arm64` image is published for your Kubernetes version:
+
+```sh
+gcloud compute images list --project=ubuntu-os-gke-cloud \
+  --filter="name~'^ubuntu-gke-2404-<major>-<minor>-arm64-v'" --sort-by=~creationTimestamp
+```
+
 To verify arm64 machine types are available in your cluster's region:
 
 ```sh
@@ -169,6 +198,18 @@ If an idle node is not being removed, check the following:
 - **`consolidateAfter` and disruption budgets.** Karpenter waits for `consolidateAfter` to elapse before disrupting a node, and disruption budgets can block or rate-limit removals. A budget that sets `nodes: "0"` for the `Empty` reason prevents empty-node removal entirely. Review the NodePool's `spec.disruption` to confirm the timing and budgets are what you expect.
 
 - **`consolidationPolicy`.** `WhenEmpty` removes only nodes that have no reschedulable pods. A node that still runs a Deployment-owned system pod — such as the GKE `konnectivity-agent` — is not considered empty by Karpenter core, because the pod is not DaemonSet overhead. Such a node remains until it can be consolidated as underutilized. Use `WhenEmptyOrUnderutilized` if you want Karpenter to consider removing or replacing these lightly loaded nodes.
+
+  ```yaml
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 30s
+  ```
+
+Check the current disruption settings on your NodePools with:
+
+```sh
+kubectl get nodepools -o yaml
+```
 
 See the [NodePool disruption reference](reference/nodepool.md#disruption) for the full list of settings.
 
@@ -190,7 +231,7 @@ GC only deletes instances that carry the Karpenter cluster tag and have no corre
 
 ## Insufficient capacity errors
 
-When Karpenter cannot provision an instance due to insufficient capacity (Spot or on-demand), it logs the error and marks the zone/instance-type/capacity-type combination as unavailable for 30 minutes. Karpenter skips these cached entries during zone selection, allowing the TTL to expire naturally so zones can recover and become available again.
+When Karpenter cannot provision an instance due to insufficient capacity (Spot or on-demand), it logs the error and marks the zone/instance-type/capacity-type combination as unavailable. The duration depends on the error: 5 minutes for a stockout, 1 hour when GCE reports that the zone does not support the requested configuration (`configuration_availability` or `MACHINE_TYPE_UNSUPPORTED`), and 30 seconds for IP space exhaustion. Karpenter skips these cached entries during zone selection, allowing the TTL to expire naturally so zones can recover and become available again.
 
 If all zones for a given instance type are exhausted, Karpenter returns an insufficient capacity error immediately without attempting GCP API calls that would fail.
 
@@ -213,6 +254,20 @@ To increase provisioning success:
   ```
 
 - Allow both spot and on-demand to let Karpenter fall back automatically.
+
+---
+
+## NodeClaim launch fails with `ResourceNotReady`
+
+If the `NodeClaim` `Launched` condition reports the reason `ResourceNotReady`, GCE rejected the instance. A resource that the instance references is not ready yet. This resource is usually the boot image, for example when the image status changed after Karpenter selected it.
+
+The problem affects every instance type, so Karpenter does not try the next instance type. It also does not mark the instance type or zone as unavailable. Karpenter retries the launch later and starts again from the lowest-priced instance type. The launch succeeds after the resource becomes ready.
+
+If the condition persists, confirm that the boot image status is `READY`:
+
+```sh
+gcloud compute images describe <image-name> --project <image-project> --format="value(status)"
+```
 
 ---
 

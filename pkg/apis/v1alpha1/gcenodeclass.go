@@ -28,6 +28,7 @@ import (
 
 // GCENodeClassSpec is the top level specification for the GCP Karpenter Provider.
 // This will contain the configuration necessary to launch instances in GCP.
+// +kubebuilder:validation:XValidation:message="subnetRangeName and subnetRangeNames are mutually exclusive",rule="!(has(self.subnetRangeName) && has(self.subnetRangeNames))"
 type GCENodeClassSpec struct {
 	// ServiceAccount is the GCP IAM service account email to assign to the instance
 	// +kubebuilder:validation:Pattern=`^[^@]+@(developer\.gserviceaccount\.com|[^@]+\.iam\.gserviceaccount\.com)$`
@@ -50,14 +51,30 @@ type GCENodeClassSpec struct {
 	// +optional
 	ImageFamily *string `json:"imageFamily,omitempty"`
 	// SubnetRangeName is the name of the subnetwork secondary IPv4 range from which
-	// to allocate pod IP addresses (alias IPs for pods). If not specified, the cluster's
-	// default pod secondary range (ClusterSecondaryRangeName from the cluster's IP
-	// allocation policy) is used.
+	// to allocate pod IP addresses (alias IPs for pods). When set, only this range is
+	// considered. Mutually exclusive with subnetRangeNames. If neither field is set,
+	// the cluster's default and additional pod ranges on its primary subnetwork are used.
+	//
+	// Deprecated: use SubnetRangeNames with a single entry instead.
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=63
 	// +kubebuilder:validation:Pattern=`^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$`
 	// +optional
 	SubnetRangeName *string `json:"subnetRangeName,omitempty"`
+	// SubnetRangeNames is a list of subnetwork secondary IPv4 range names from which
+	// to allocate pod IP addresses (alias IPs for pods). When more than one name is
+	// listed, the provider prefers the range with the most Compute-reported free IPv4 addresses
+	// at launch. Mutually exclusive with subnetRangeName. When set, this list replaces
+	// the cluster defaults completely. If neither field is set, the cluster's default
+	// and additional pod ranges on its primary subnetwork are used.
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=16
+	// +kubebuilder:validation:XValidation:message="subnetRangeNames must be unique",rule="self.all(x, self.exists_one(y, x == y))"
+	// +kubebuilder:validation:items:MinLength=1
+	// +kubebuilder:validation:items:MaxLength=63
+	// +kubebuilder:validation:items:Pattern=`^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$`
+	// +optional
+	SubnetRangeNames []string `json:"subnetRangeNames,omitempty"`
 	// KubeletConfiguration defines args to be used when configuring kubelet on provisioned nodes.
 	// They are a vswitch of the upstream types, recognizing not all options may be supported.
 	// Wherever possible, the types and names should reflect the upstream kubelet types.
@@ -66,7 +83,12 @@ type GCENodeClassSpec struct {
 	// +kubebuilder:validation:XValidation:message="evictionSoftGracePeriod OwnerKey does not have a matching evictionSoft",rule="has(self.evictionSoftGracePeriod) ? self.evictionSoftGracePeriod.all(e, (e in self.evictionSoft)):true"
 	// +optional
 	KubeletConfiguration *KubeletConfiguration `json:"kubeletConfiguration,omitempty"`
-	// Labels to be applied on GCE VM instance.
+	// LinuxNodeConfig configures the Linux kernel of provisioned nodes.
+	// Mirrors GKE node pool linux_node_config.
+	// +optional
+	LinuxNodeConfig *LinuxNodeConfig `json:"linuxNodeConfig,omitempty"`
+	// Labels to be applied on the GCE VM instance and its persistent disks.
+	// Local SSD scratch disks do not support labels.
 	// +kubebuilder:validation:MaxProperties=20
 	// +kubebuilder:validation:XValidation:message="empty tag keys aren't supported",rule="self.all(k, k != '')"
 	// +kubebuilder:validation:XValidation:message="tag contains a restricted tag matching gce:gce-cluster-name",rule="self.all(k, k !='gce:gce-cluster-name')"
@@ -89,6 +111,9 @@ type GCENodeClassSpec struct {
 	// virtual TPM, and integrity monitoring.
 	// +optional
 	ShieldedInstanceConfig *ShieldedInstanceConfig `json:"shieldedInstanceConfig,omitempty"`
+	// AdvancedMachineFeatures configures advanced CPU and virtualisation options for provisioned nodes.
+	// +optional
+	AdvancedMachineFeatures *AdvancedMachineFeatures `json:"advancedMachineFeatures,omitempty"`
 	// ConfidentialInstanceType enables Confidential VM for provisioned nodes using the
 	// named technology (AMD SEV / SEV-SNP or Intel TDX), providing in-use memory
 	// encryption. Leave unset to disable. Only supported on specific machine families.
@@ -112,7 +137,35 @@ type GCENodeClassSpec struct {
 	// +kubebuilder:default=default
 	// +optional
 	GPUDriverVersion string `json:"gpuDriverVersion,omitempty"`
+	// LocalSsdMode exposes local SSDs as raw devices or kubelet ephemeral storage.
+	// +kubebuilder:default=RawBlock
+	// +optional
+	LocalSsdMode LocalSSDMode `json:"localSsdMode,omitempty"`
+	// PreemptionNoticeDuration is how long before shutdown GCE flips the
+	// instance/preempted metadata key on a Spot VM. Unset (the default) gives no advance
+	// notice: the key flips at the same moment the ACPI G2 Soft Off signal is sent.
+	// "120s" gives a two-minute warning, letting Karpenter start draining before shutdown.
+	// GCE currently accepts up to two minutes.
+	// Only applies to Spot capacity; ignored for on-demand nodes.
+	// Reading the notice requires an agent on the node that watches the metadata key
+	// and sets the GCESpotPreempting condition — see docs/spot-preemption.md.
+	// +kubebuilder:validation:Type=string
+	// +kubebuilder:validation:Pattern=`^([0-9]+(s|m|h))+$`
+	// +kubebuilder:validation:XValidation:message="preemptionNoticeDuration must not exceed 120s",rule="duration(self) <= duration('120s')"
+	// +optional
+	PreemptionNoticeDuration *metav1.Duration `json:"preemptionNoticeDuration,omitempty"`
 }
+
+// LocalSSDMode controls how local SSDs are exposed to workloads.
+// +kubebuilder:validation:Enum=RawBlock;Ephemeral
+type LocalSSDMode string
+
+const (
+	// LocalSSDModeRawBlock leaves local SSDs unformatted.
+	LocalSSDModeRawBlock LocalSSDMode = "RawBlock"
+	// LocalSSDModeEphemeral uses local SSDs for kubelet ephemeral storage.
+	LocalSSDModeEphemeral LocalSSDMode = "Ephemeral"
+)
 
 // NetworkConfig holds network settings for provisioned nodes.
 // The shape mirrors the Terraform google_container_node_pool network_config block
@@ -217,6 +270,7 @@ type KubeletQuantity string
 // Wherever possible, the types and names should reflect the upstream kubelet types.
 // https://pkg.go.dev/k8s.io/kubelet/config/v1beta1#KubeletConfiguration
 // https://github.com/kubernetes/kubernetes/blob/9f82d81e55cafdedab619ea25cabf5d42736dacf/cmd/kubelet/app/options/options.go#L53
+// +kubebuilder:validation:XValidation:message="maxParallelImagePulls greater than 1 requires serializeImagePulls to be explicitly set to false",rule="!has(self.maxParallelImagePulls) || self.maxParallelImagePulls < 2 || (has(self.serializeImagePulls) && self.serializeImagePulls == false)"
 type KubeletConfiguration struct {
 	// clusterDNS is a list of IP addresses for the cluster DNS server.
 	// Note that not all providers may use all addresses.
@@ -288,6 +342,19 @@ type KubeletConfiguration struct {
 	// CPUCFSQuota enables CPU CFS quota enforcement for containers that specify CPU limits.
 	// +optional
 	CPUCFSQuota *bool `json:"cpuCFSQuota,omitempty"`
+	// SerializeImagePulls, when enabled, tells the kubelet to pull images one at a
+	// time. Must be explicitly set to false to set MaxParallelImagePulls above 1.
+	// Default: true
+	// +optional
+	SerializeImagePulls *bool `json:"serializeImagePulls,omitempty"`
+	// MaxParallelImagePulls sets the maximum number of image pulls in parallel.
+	// Values above 1 require SerializeImagePulls to be explicitly set to false.
+	// Nodes with many DaemonSets pulling cold images concurrently (a common case
+	// right after a fresh node joins the cluster) benefit most from raising this
+	// above the kubelet default of 1.
+	// +kubebuilder:validation:Minimum:=1
+	// +optional
+	MaxParallelImagePulls *int32 `json:"maxParallelImagePulls,omitempty"`
 }
 
 // +kubebuilder:validation:XValidation:message="provisionedIOPS is only applicable for pd-extreme, hyperdisk-balanced, hyperdisk-balanced-high-availability, and hyperdisk-extreme",rule="!has(self.provisionedIOPS) || self.category in ['pd-extreme', 'hyperdisk-balanced', 'hyperdisk-balanced-high-availability', 'hyperdisk-extreme']"
@@ -334,7 +401,7 @@ type Disk struct {
 }
 
 // DiskCategory represents a disk category type
-// +kubebuilder:validation:Enum=hyperdisk-balanced;hyperdisk-balanced-high-availability;hyperdisk-extreme;hyperdisk-ml;hyperdisk-throughput;local-ssd;pd-balanced;pd-extreme;pd-ssd;pd-standard
+// +kubebuilder:validation:Enum=hyperdisk-balanced;hyperdisk-balanced-high-availability;hyperdisk-extreme;hyperdisk-ml;hyperdisk-throughput;pd-balanced;pd-extreme;pd-ssd;pd-standard
 type DiskCategory string
 
 // SecondaryBootDiskMode is the mode of the secondary boot disk.
@@ -362,6 +429,37 @@ type ShieldedInstanceConfig struct {
 	EnableIntegrityMonitoring *bool `json:"enableIntegrityMonitoring,omitempty"`
 }
 
+// LinuxNodeConfig defines the Linux kernel options for a provisioned node.
+type LinuxNodeConfig struct {
+	// Hugepages configures the static hugepages that the node allocates at boot.
+	// Mirrors GKE node pool linux_node_config.hugepages_config.
+	// +optional
+	Hugepages *HugepagesConfig `json:"hugepages,omitempty"`
+}
+
+// HugepagesConfig defines the static hugepages that a node allocates at boot.
+// Karpenter does not add the hugepages to the instance type capacity. Use a
+// NodeOverlay to advertise the hugepages capacity to the scheduling simulation.
+type HugepagesConfig struct {
+	// HugepageSize2m is the number of 2 MiB hugepages to allocate.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	HugepageSize2m *int32 `json:"hugepageSize2m,omitempty"`
+	// HugepageSize1g is the number of 1 GiB hugepages to allocate.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	HugepageSize1g *int32 `json:"hugepageSize1g,omitempty"`
+}
+
+// AdvancedMachineFeatures defines advanced CPU and virtualisation options for a GCE instance.
+type AdvancedMachineFeatures struct {
+	// EnableNestedVirtualization defines whether the instance can run nested virtual machines.
+	// Only supported on Intel-based machine families; not supported on E2, AMD, Arm or
+	// Confidential VM instances.
+	// +optional
+	EnableNestedVirtualization *bool `json:"enableNestedVirtualization,omitempty"`
+}
+
 // GCENodeClass is the Schema for the GCENodeClass API
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 // +kubebuilder:resource:path=gcenodeclasses,scope=Cluster,categories=karpenter,shortName={gcenc,gcencs}
@@ -383,11 +481,11 @@ const (
 	// 1. A field changes its default value for an existing field that is already hashed
 	// 2. A field is added to the hash calculation with an already-set value
 	// 3. A field is removed from the hash calculations
-	GCENodeClassHashVersion = "v4"
+	GCENodeClassHashVersion = "v5"
 )
 
 func (in *GCENodeClass) Hash() string {
-	return fmt.Sprint(lo.Must(hashstructure.Hash([]interface{}{
+	return fmt.Sprint(lo.Must(hashstructure.Hash([]any{
 		in.Spec,
 		in.ImageFamily(),
 	}, hashstructure.FormatV2, &hashstructure.HashOptions{
@@ -473,4 +571,19 @@ func (in *GCENodeClass) GetMaxPods() int32 {
 		return *in.Spec.KubeletConfiguration.MaxPods
 	}
 	return KubeletMaxPods
+}
+
+// PodSubnetRangeNames returns the NodeClass-configured pod secondary range names.
+// An empty result means the launch path should discover the cluster's pod ranges.
+func (in *GCENodeClass) PodSubnetRangeNames() []string {
+	if in == nil {
+		return nil
+	}
+	if len(in.Spec.SubnetRangeNames) > 0 {
+		return append([]string(nil), in.Spec.SubnetRangeNames...)
+	}
+	if in.Spec.SubnetRangeName != nil && *in.Spec.SubnetRangeName != "" {
+		return []string{*in.Spec.SubnetRangeName}
+	}
+	return nil
 }

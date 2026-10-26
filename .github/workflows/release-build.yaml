@@ -22,7 +22,7 @@ jobs:
         with:
           submodules: true
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: false
@@ -79,6 +79,11 @@ jobs:
             echo "ERROR: Failed to fetch Pages index — HTTP ${HTTP_CODE}. Aborting to avoid losing old chart versions."
             exit 1
           fi
+
+      - name: Build chart dependencies
+        run: |
+          # charts/ is not committed; helm package fails without the pinned subchart archives
+          helm dependency build charts/karpenter
 
       - name: Package charts
         run: |

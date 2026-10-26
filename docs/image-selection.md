@@ -27,6 +27,8 @@ Each term in `imageSelectorTerms` must use exactly one of three selection modes:
 | Version pin       | `family` + `version` | Fixed image. Nodes never drift from image changes.                                              |
 | Raw image ID      | `id`                 | Explicit GCE image URL. Nodes never drift from image changes.                                   |
 
+Karpenter only uses GCE images whose status is `READY`, so a newly published image can't start a node replacement before GCP finishes publishing it. `version: latest` selects the newest `READY` image and skips images that are still `PENDING`. For channel, version pin, and raw image ID terms, Karpenter waits until the matching image is `READY`. Until then, it keeps the images already recorded in the GCENodeClass status and retries resolution. Depending on the term, the `ImagesReady` condition reports `ImageResolutionFailed`, or the controller logs an `image <name> is not ready (status: PENDING)` error.
+
 ### Channel reference (live)
 
 Track a GKE release channel for Container-Optimized OS:
@@ -95,6 +97,8 @@ imageSelectorTerms:
 | `Ubuntu2204`           | Ubuntu 22.04 LTS       | Supports `version` only          |
 
 The bare `Ubuntu` family name is not supported. Use `Ubuntu2404` or `Ubuntu2204` explicitly.
+
+> **Note:** Ubuntu images are resolved per architecture, independently, from the `ubuntu-os-gke-cloud` catalog for the cluster's Kubernetes minor version. Only standard date builds are selected — `vYYYYMMDD`, optionally with a trailing letter (for example, `v20260416a` may be resolved by `version: latest`). Specialized GKE variant builds are excluded from selection, such as `-tpu`, `-cgroupsv1`, or `-linux64k`. If an architecture (for example, arm64) has no usable image for the cluster's Kubernetes minor version, resolution fails, and the GCENodeClass's `ImagesReady` condition reports `ImageResolutionFailed`. Use [Finding Available Versions](image-management.md#finding-available-versions) to confirm a date is published for both amd64 and arm64 before pinning, regardless of the NodePool's own architecture. amd64 and arm64 builds for a given date are published independently, so a `version: vYYYYMMDD` pin available for one architecture may not exist for the other. Pinning a date present for only one of the two architectures fails the same way, rather than silently synthesizing a nonexistent image.
 
 ## Version formats
 

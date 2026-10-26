@@ -23,12 +23,15 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"math/big"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
+	"cloud.google.com/go/compute/apiv1/computepb"
 	"github.com/patrickmn/go-cache"
 	"github.com/samber/lo"
 	"google.golang.org/api/compute/v1"
@@ -48,10 +51,13 @@ import (
 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/providers/disktype"
 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/providers/gke"
 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/providers/imagefamily"
+	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/providers/instancetype"
 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/providers/nodepooltemplate"
 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/providers/offerings/unavailableofferings"
+	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/providers/subnet"
 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/providers/version"
 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/utils"
+	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/utils/localssd"
 )
 
 const (
@@ -61,6 +67,8 @@ const (
 	zoneOperationPollInterval      = 1 * time.Second
 	defaultZoneOperationTimeout    = 2 * time.Minute
 	ipSpaceInsufficientCapacityTTL = 30 * time.Second
+	stockoutTTL                    = 5 * time.Minute
+	unsupportedConfigurationTTL    = 1 * time.Hour
 
 	instanceTerminationActionDelete = "DELETE"
 )
@@ -70,7 +78,15 @@ var InsufficientCapacityErrorCodes = sets.NewString(
 	"ZONE_RESOURCE_POOL_EXHAUSTED",
 	"IP_SPACE_EXHAUSTED_WITH_DETAILS",
 	"IP_SPACE_EXHAUSTED",
+	"MACHINE_TYPE_UNSUPPORTED",
 )
+
+type insufficientCapacityDetails struct {
+	code             string
+	structuredReason string
+	message          string
+	operation        string
+}
 
 type Provider interface {
 	Create(context.Context, *v1alpha1.GCENodeClass, *karpv1.NodeClaim, []*cloudprovider.InstanceType) (*Instance, error)
@@ -82,6 +98,8 @@ type Provider interface {
 
 type DefaultProvider struct {
 	gkeProvider              gke.Provider
+	subnetProvider           subnet.Provider
+	instanceTypeProvider     instancetype.Provider
 	nodePoolTemplateProvider nodepooltemplate.Provider
 	versionProvider          version.Provider
 	unavailableOfferings     *unavailableofferings.UnavailableOfferings
@@ -101,12 +119,16 @@ type DefaultProvider struct {
 func NewProvider(clusterName, clusterLocation, region, projectID, defaultServiceAccount, computeDefaultSA string,
 	computeService *compute.Service,
 	gkeProvider gke.Provider,
+	subnetProvider subnet.Provider,
+	instanceTypeProvider instancetype.Provider,
 	nodePoolTemplateProvider nodepooltemplate.Provider,
 	versionProvider version.Provider,
 	unavailableOfferings *unavailableofferings.UnavailableOfferings,
 ) Provider {
 	return &DefaultProvider{
 		gkeProvider:              gkeProvider,
+		subnetProvider:           subnetProvider,
+		instanceTypeProvider:     instanceTypeProvider,
 		nodePoolTemplateProvider: nodePoolTemplateProvider,
 		versionProvider:          versionProvider,
 		unavailableOfferings:     unavailableOfferings,
@@ -121,9 +143,7 @@ func NewProvider(clusterName, clusterLocation, region, projectID, defaultService
 	}
 }
 
-func (p *DefaultProvider) waitOperationDone(ctx context.Context,
-	instanceType, zone, capacityType, operationName string,
-) error {
+func (p *DefaultProvider) waitOperationDone(ctx context.Context, zone, operationName string) error {
 	waitCtx := ctx
 	cancel := func() {}
 	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
@@ -153,7 +173,7 @@ func (p *DefaultProvider) waitOperationDone(ctx context.Context,
 
 		if op.Status == "DONE" {
 			if op.Error != nil {
-				return p.handleZoneOperationError(waitCtx, op, instanceType, zone, capacityType)
+				return handleZoneOperationError(op)
 			}
 			return nil
 		}
@@ -173,16 +193,24 @@ func waitForNextTick(ctx context.Context, ticker *time.Ticker) error {
 	}
 }
 
-func (p *DefaultProvider) handleZoneOperationError(ctx context.Context, op *compute.Operation, instanceType, zone, capacityType string) error {
-	capacityError, found := lo.Find(op.Error.Errors, isInsufficientCapacityError)
+// insufficientCapacityError carries structured GCE details alongside the
+// human-readable reason. Callers need the code to decide whether another pod range
+// is worth trying before the offering is marked unavailable.
+type insufficientCapacityError struct {
+	details insufficientCapacityDetails
+}
+
+func (e *insufficientCapacityError) Error() string {
+	if e.details.message != "" {
+		return e.details.message
+	}
+	return e.details.code
+}
+
+func handleZoneOperationError(op *compute.Operation) error {
+	details, found := extractOperationInsufficientCapacityDetails(op)
 	if found {
-		reason := capacityError.Message
-		if reason == "" {
-			reason = capacityError.Code
-		}
-		ttl := insufficientCapacityBackoffTTL(capacityError.Code)
-		p.unavailableOfferings.MarkUnavailableWithTTL(ctx, reason, instanceType, zone, capacityType, ttl)
-		return cloudprovider.NewInsufficientCapacityError(fmt.Errorf("zone %s insufficient capacity: %s", zone, reason))
+		return &insufficientCapacityError{details: details}
 	}
 
 	errorMsgs := lo.Map(op.Error.Errors, func(e *compute.OperationErrorErrors, _ int) string {
@@ -192,8 +220,7 @@ func (p *DefaultProvider) handleZoneOperationError(ctx context.Context, op *comp
 }
 
 func isTransientError(err error) bool {
-	var apiErr *googleapi.Error
-	if errors.As(err, &apiErr) {
+	if apiErr, ok := errors.AsType[*googleapi.Error](err); ok {
 		return apiErr.Code >= 500
 	}
 	return false
@@ -207,31 +234,122 @@ func isInsufficientCapacityError(operationError *compute.OperationErrorErrors) b
 	return InsufficientCapacityErrorCodes.Has(operationError.Code)
 }
 
-func extractInsertInsufficientCapacityReason(err error) (string, string, bool) {
+func extractOperationInsufficientCapacityDetails(op *compute.Operation) (insufficientCapacityDetails, bool) {
+	if op == nil || op.Error == nil {
+		return insufficientCapacityDetails{}, false
+	}
+
+	capacityError, found := lo.Find(op.Error.Errors, isInsufficientCapacityError)
+	if !found {
+		return insufficientCapacityDetails{}, false
+	}
+
+	details := insufficientCapacityDetails{
+		code:      capacityError.Code,
+		message:   capacityError.Message,
+		operation: op.Name,
+	}
+	for _, detail := range capacityError.ErrorDetails {
+		if detail == nil {
+			continue
+		}
+		if details.structuredReason == "" && detail.ErrorInfo != nil {
+			details.structuredReason = detail.ErrorInfo.Reason
+		}
+		if detail.LocalizedMessage != nil && detail.LocalizedMessage.Message != "" {
+			details.message = detail.LocalizedMessage.Message
+		}
+	}
+	if details.message == "" {
+		details.message = details.code
+	}
+	return details, true
+}
+
+func extractInsertInsufficientCapacityDetails(err error) (insufficientCapacityDetails, bool) {
 	var apiError *googleapi.Error
 	if !errors.As(err, &apiError) {
-		return "", "", false
+		return insufficientCapacityDetails{}, false
 	}
 
 	for _, detail := range apiError.Errors {
 		if InsufficientCapacityErrorCodes.Has(detail.Reason) {
-			reason := detail.Message
-			if reason == "" {
-				reason = detail.Reason
+			message := detail.Message
+			if message == "" {
+				message = detail.Reason
 			}
-			return reason, detail.Reason, true
+			return insufficientCapacityDetails{
+				code:             detail.Reason,
+				structuredReason: detail.Reason,
+				message:          message,
+			}, true
 		}
 	}
 
-	return "", "", false
+	return insufficientCapacityDetails{}, false
 }
 
-func insufficientCapacityBackoffTTL(reasonCode string) time.Duration {
-	if reasonCode == "IP_SPACE_EXHAUSTED_WITH_DETAILS" || reasonCode == "IP_SPACE_EXHAUSTED" {
-		return ipSpaceInsufficientCapacityTTL
+func newInsufficientCapacityError(instanceType, zone, capacityType string, ttl time.Duration, details insufficientCapacityDetails) error {
+	gceDetails := []string{}
+	if details.structuredReason != "" && details.structuredReason != details.code {
+		gceDetails = append(gceDetails, "reason="+details.structuredReason)
 	}
+	if details.operation != "" {
+		gceDetails = append(gceDetails, "op="+details.operation)
+	}
+	gceDetails = append(gceDetails, "code="+details.code)
+	status := "unavailable"
+	if isUnsupportedConfiguration(details) {
+		status = "unsupported configuration"
+	}
+	return cloudprovider.NewInsufficientCapacityError(fmt.Errorf(
+		"%s %s/%s %s %s (%s): %s",
+		instanceType, capacityType, zone, status, ttl, strings.Join(gceDetails, ", "), details.message,
+	))
+}
 
-	return unavailableofferings.DefaultTTL
+func isResourceNotReadyError(err error) bool {
+	if apiErr, ok := errors.AsType[*googleapi.Error](err); ok {
+		return lo.ContainsBy(apiErr.Errors, func(e googleapi.ErrorItem) bool {
+			return e.Reason == "resourceNotReady"
+		})
+	}
+	return false
+}
+
+func isIPSpaceExhausted(details insufficientCapacityDetails) bool {
+	return details.code == "IP_SPACE_EXHAUSTED_WITH_DETAILS" || details.code == "IP_SPACE_EXHAUSTED"
+}
+
+// isUnsupportedConfiguration reports whether the zone does not support the
+// request, which does not resolve with time. IP space exhaustion takes
+// precedence.
+func isUnsupportedConfiguration(details insufficientCapacityDetails) bool {
+	return !isIPSpaceExhausted(details) &&
+		(details.code == "MACHINE_TYPE_UNSUPPORTED" || details.structuredReason == "configuration_availability")
+}
+
+func insufficientCapacityBackoffTTL(details insufficientCapacityDetails) time.Duration {
+	switch {
+	case isIPSpaceExhausted(details):
+		return ipSpaceInsufficientCapacityTTL
+	case isUnsupportedConfiguration(details):
+		return unsupportedConfigurationTTL
+	default:
+		return stockoutTTL
+	}
+}
+
+// markInsufficientCapacity records the offering as unavailable and converts the GCE
+// failure into the error type karpenter core understands. Only call this once no other
+// pod range is left to try, otherwise a successful fallback still evicts the offering.
+func (p *DefaultProvider) markInsufficientCapacity(ctx context.Context, instanceType, zone, capacityType string, details insufficientCapacityDetails) error {
+	if details.message == "" {
+		details.message = "insufficient capacity"
+	}
+	ttl := insufficientCapacityBackoffTTL(details)
+	p.unavailableOfferings.MarkUnavailableWithTTL(ctx, details.message, instanceType, zone, capacityType, ttl)
+	return newInsufficientCapacityError(instanceType, zone, capacityType, ttl, details)
 }
 
 func (p *DefaultProvider) isInstanceExists(ctx context.Context, zone, instanceName string) (*compute.Instance, bool, error) {
@@ -269,15 +387,16 @@ func (p *DefaultProvider) findInstanceByNodeClaim(ctx context.Context, nodeClaim
 	return instance, nil
 }
 
+func lastPathSegment(value string) string {
+	if split := strings.Split(value, "/"); len(split) > 0 {
+		return split[len(split)-1]
+	}
+	return value
+}
+
 func (p *DefaultProvider) adoptExistingInstance(ctx context.Context, existingInstance *compute.Instance, capacityType string) *Instance {
-	zone := existingInstance.Zone
-	if split := strings.Split(zone, "/"); len(split) > 0 {
-		zone = split[len(split)-1]
-	}
-	machineType := existingInstance.MachineType
-	if split := strings.Split(machineType, "/"); len(split) > 0 {
-		machineType = split[len(split)-1]
-	}
+	zone := lastPathSegment(existingInstance.Zone)
+	machineType := lastPathSegment(existingInstance.MachineType)
 
 	log.FromContext(ctx).Info("Found existing instance for NodeClaim", "instance", existingInstance.Name, "zone", zone)
 	return &Instance{
@@ -300,23 +419,35 @@ func (p *DefaultProvider) Create(ctx context.Context, nodeClass *v1alpha1.GCENod
 		return nil, fmt.Errorf("no instance types provided")
 	}
 
-	instanceTypes = orderInstanceTypesByPrice(instanceTypes, scheduling.NewNodeSelectorRequirementsWithMinValues(nodeClaim.Spec.Requirements...))
-	capacityType := p.getCapacityType(nodeClaim, instanceTypes)
+	requirements := scheduling.NewNodeSelectorRequirementsWithMinValues(nodeClaim.Spec.Requirements...)
+	instanceTypes = orderInstanceTypesByPrice(instanceTypes, requirements)
+	launchInstanceTypes, rejectedConfigurable := instanceTypesForLaunch(nodeClaim, instanceTypes)
 
-	// Check if the instance already exists in any zone
+	// Check for an instance in any zone before validating launch candidates so earlier attempts are adopted.
 	if existingInstance, err := p.findInstanceByNodeClaim(ctx, nodeClaim); err != nil {
 		log.FromContext(ctx).Error(err, "failed to check if instance exists in region", "nodeClaim", nodeClaim.Name)
 	} else if existingInstance != nil {
-		return p.adoptExistingInstance(ctx, existingInstance, capacityType), nil
+		return p.adoptExistingInstance(ctx, existingInstance, p.getCapacityType(nodeClaim, instanceTypes)), nil
 	}
 
+	launchInstanceTypes, err := validateLaunchInstanceTypes(launchInstanceTypes, rejectedConfigurable)
+	if err != nil {
+		return nil, err
+	}
+
+	instanceTypes = orderInstanceTypesByPrice(launchInstanceTypes, requirements)
+	capacityType := p.getCapacityType(nodeClaim, instanceTypes)
+	freeIPs := p.podRangeFreeIPs(ctx, nodeClass)
 	var errs []error
+	var attemptedZones []string
 	// try all instance types, if one is available, use it
 	for _, instanceType := range instanceTypes {
-		instance, zone, err := p.tryCreateInstance(ctx, nodeClass, nodeClaim, instanceType, capacityType)
+		instance, zone, err := p.tryCreateInstance(ctx, nodeClass, nodeClaim, instanceType, capacityType, attemptedZones, freeIPs)
+		if zone != "" && !lo.Contains(attemptedZones, zone) {
+			attemptedZones = append(attemptedZones, zone)
+		}
 		if err != nil {
-			var retryableErr *retryableError
-			if errors.As(err, &retryableErr) {
+			if retryableErr, ok := errors.AsType[*retryableError](err); ok {
 				errs = append(errs, retryableErr.err)
 				continue
 			}
@@ -335,7 +466,7 @@ func (p *DefaultProvider) Create(ctx context.Context, nodeClass *v1alpha1.GCENod
 			// Refer to https://github.com/cloudpilot-ai/karpenter-provider-gcp/pull/45#discussion_r2115586327
 			// In this develop period, we are using a static instance type to avoid high cost of creating a new instance type for each node claim.
 			// Type:         instanceType.Name,
-			Type:         instanceType.Name,
+			Type:         lastPathSegment(instance.MachineType),
 			Location:     zone,
 			ProjectID:    p.projectID,
 			ImageID:      resolveInstanceImage(instance),
@@ -352,10 +483,6 @@ func (p *DefaultProvider) Create(ctx context.Context, nodeClass *v1alpha1.GCENod
 	}
 
 	joined := errors.Join(errs...)
-	if lo.SomeBy(errs, cloudprovider.IsInsufficientCapacityError) {
-		return nil, cloudprovider.NewInsufficientCapacityError(fmt.Errorf("failed to create instance after trying all instance types: %w", joined))
-	}
-
 	return nil, fmt.Errorf("failed to create instance after trying all instance types: %w", joined)
 }
 
@@ -367,7 +494,14 @@ func (e *retryableError) Error() string {
 	return e.err.Error()
 }
 
-func (p *DefaultProvider) tryCreateInstance(ctx context.Context, nodeClass *v1alpha1.GCENodeClass, nodeClaim *karpv1.NodeClaim, instanceType *cloudprovider.InstanceType, capacityType string) (*compute.Instance, string, error) {
+func (p *DefaultProvider) tryCreateInstance(ctx context.Context, nodeClass *v1alpha1.GCENodeClass, nodeClaim *karpv1.NodeClaim, instanceType *cloudprovider.InstanceType, capacityType string, attemptedZones []string, freeIPs map[string]int64) (*compute.Instance, string, error) {
+	mt := p.instanceTypeProvider.GetMachineType(instanceType.Name)
+
+	ssdCount, err := resolveCreateSSDCount(instanceType)
+	if err != nil {
+		return nil, "", err
+	}
+
 	zone, err := p.selectZone(ctx, nodeClaim, instanceType, capacityType)
 	if err != nil {
 		log.FromContext(ctx).Error(err, "failed to select zone for instance type", "instanceType", instanceType.Name)
@@ -377,69 +511,106 @@ func (p *DefaultProvider) tryCreateInstance(ctx context.Context, nodeClass *v1al
 	sourceMetadata, err := p.nodePoolTemplateProvider.GetSourceTemplateMetadata(ctx)
 	if err != nil {
 		log.FromContext(ctx).Error(err, "failed to get source template metadata")
-		return nil, "", &retryableError{err}
+		return nil, zone, &retryableError{err}
 	}
 
 	clusterConfig, err := p.gkeProvider.GetClusterConfig(ctx)
 	if err != nil {
 		log.FromContext(ctx).Error(err, "failed to fetch cluster config")
-		return nil, "", &retryableError{err}
+		return nil, zone, &retryableError{err}
 	}
 
-	instance, retryable, err := p.getOrCreateInstance(ctx, nodeClaim, nodeClass, instanceType, sourceMetadata, clusterConfig, zone, capacityType)
+	instance, effectiveZone, retryable, err := p.getOrCreateInstance(ctx, nodeClaim, nodeClass, instanceType, sourceMetadata, clusterConfig, zone, capacityType, attemptedZones, mt, ssdCount, freeIPs)
 	if err != nil {
 		if retryable {
-			return nil, "", &retryableError{err}
+			return nil, zone, &retryableError{err}
 		}
-		return nil, "", err
+		return nil, zone, err
 	}
 
-	return instance, zone, nil
+	return instance, effectiveZone, nil
 }
 
-func (p *DefaultProvider) getOrCreateInstance(ctx context.Context, nodeClaim *karpv1.NodeClaim, nodeClass *v1alpha1.GCENodeClass, instanceType *cloudprovider.InstanceType, sourceMetadata *compute.Metadata, clusterConfig *container.Cluster, zone, capacityType string) (*compute.Instance, bool, error) {
+func (p *DefaultProvider) getOrCreateInstance(ctx context.Context, nodeClaim *karpv1.NodeClaim, nodeClass *v1alpha1.GCENodeClass, instanceType *cloudprovider.InstanceType, sourceMetadata *compute.Metadata, clusterConfig *container.Cluster, zone, capacityType string, attemptedZones []string, mt *computepb.MachineType, ssdCount int, freeIPs map[string]int64) (*compute.Instance, string, bool, error) {
 	instanceName := fmt.Sprintf("karpenter-%s", nodeClaim.Name)
-	instance, exists, err := p.isInstanceExists(ctx, zone, instanceName)
-	if err != nil {
-		log.FromContext(ctx).Error(err, "failed to check if instance exists", "instanceName", instanceName)
-		return nil, false, fmt.Errorf("failed to check if instance exists: %w", err)
-	}
-
-	if exists {
-		return instance, false, nil
-	}
-
-	instance, err = p.buildInstance(ctx, nodeClaim, nodeClass, instanceType, sourceMetadata, clusterConfig, zone, instanceName, capacityType)
-	if err != nil {
-		return nil, false, fmt.Errorf("building instance %s: %w", instanceName, err)
-	}
-	op, err := p.computeService.Instances.Insert(p.projectID, zone, instance).Context(ctx).Do()
-	if err != nil {
-		reason, reasonCode, insufficient := extractInsertInsufficientCapacityReason(err)
-		if insufficient {
-			if reason == "" {
-				reason = "insufficient capacity"
+	for _, candidate := range lo.Uniq(append([]string{zone}, attemptedZones...)) {
+		existing, exists, err := p.isInstanceExists(ctx, candidate, instanceName)
+		if err != nil {
+			log.FromContext(ctx).Error(err, "failed to check if instance exists", "instanceName", instanceName, "zone", candidate)
+			return nil, "", false, fmt.Errorf("failed to check if instance exists: %w", err)
+		}
+		if exists {
+			if candidate != zone {
+				log.FromContext(ctx).Info("adopting instance from an earlier attempt instead of creating a duplicate in another zone",
+					"instanceName", instanceName, "existingZone", candidate, "selectedZone", zone)
 			}
-			ttl := insufficientCapacityBackoffTTL(reasonCode)
-			p.unavailableOfferings.MarkUnavailableWithTTL(ctx, reason, instanceType.Name, zone, capacityType, ttl)
-			err = cloudprovider.NewInsufficientCapacityError(fmt.Errorf("zone %s insufficient capacity: %s", zone, reason))
+			return existing, candidate, false, nil
+		}
+	}
 
-			// If IP space is exhausted, trying other instance types won't help as they share the same subnet.
-			// We should fail fast to avoid unnecessary API calls and noise.
-			if reasonCode == "IP_SPACE_EXHAUSTED" || reasonCode == "IP_SPACE_EXHAUSTED_WITH_DETAILS" {
-				return nil, false, err
+	instance, err := p.buildInstance(ctx, nodeClaim, nodeClass, instanceType, sourceMetadata, clusterConfig, zone, instanceName, capacityType, mt, ssdCount)
+	if err != nil {
+		return nil, "", false, fmt.Errorf("building instance %s: %w", instanceName, err)
+	}
+	rangeNames := rankPodRangeNames(resolvedPodRangeNames(nodeClass, clusterConfig), freeIPs)
+	discoveredRanges := len(nodeClass.PodSubnetRangeNames()) == 0
+	retryable, err := p.insertInstanceWithPodRanges(ctx, instance, instanceType, zone, capacityType, rangeNames, discoveredRanges)
+	if err != nil {
+		return nil, "", retryable, err
+	}
+	return instance, zone, false, nil
+}
+
+func (p *DefaultProvider) insertInstanceWithPodRanges(ctx context.Context, instance *compute.Instance, instanceType *cloudprovider.InstanceType, zone, capacityType string, rangeNames []string, discoveredRanges bool) (bool, error) {
+	for i, rangeName := range rangeNames {
+		setPrimaryAliasRange(instance, rangeName)
+
+		var details insufficientCapacityDetails
+		var insufficient, rejected bool
+		failureMessage := "failed to create instance"
+		op, err := p.computeService.Instances.Insert(p.projectID, zone, instance).Context(ctx).Do()
+		if err != nil {
+			details, insufficient = extractInsertInsufficientCapacityDetails(err)
+			rejected = isRejectedPodRange(err, rangeName)
+		} else {
+			err = p.waitOperationDone(ctx, zone, op.Name)
+			failureMessage = "failed to wait for operation to be done"
+			if capacityErr, ok := errors.AsType[*insufficientCapacityError](err); ok {
+				details, insufficient = capacityErr.details, true
 			}
 		}
-		log.FromContext(ctx).Error(err, "failed to create instance", "instanceType", instanceType.Name, "zone", zone)
-		return nil, true, err
+		if err == nil {
+			return false, nil
+		}
+
+		exhausted := isIPSpaceExhausted(details)
+		if exhausted || rejected {
+			p.invalidatePodRangeCaches(instance, discoveredRanges && rejected)
+		}
+		if exhausted && i < len(rangeNames)-1 {
+			log.FromContext(ctx).Info("pod range IP space exhausted, trying next range",
+				"range", rangeName, "instanceType", instanceType.Name, "zone", zone)
+			continue
+		}
+
+		retryable := true
+		if insufficient {
+			err = p.markInsufficientCapacity(ctx, instanceType.Name, zone, capacityType, details)
+			// Other instance types share the subnet, so stop once all ranges are exhausted.
+			retryable = !exhausted
+		}
+		log.FromContext(ctx).Error(err, failureMessage, "instanceType", instanceType.Name, "zone", zone)
+		return handleResourceNotReadyError(err, retryable)
 	}
 
-	if err := p.waitOperationDone(ctx, instanceType.Name, zone, capacityType, op.Name); err != nil {
-		log.FromContext(ctx).Error(err, "failed to wait for operation to be done", "instanceType", instanceType.Name, "zone", zone)
-		return nil, true, err
-	}
+	return true, fmt.Errorf("no pod secondary ranges available")
+}
 
-	return instance, false, nil
+func handleResourceNotReadyError(err error, retryable bool) (bool, error) {
+	if isResourceNotReadyError(err) {
+		return false, cloudprovider.NewCreateError(err, "ResourceNotReady", "A resource the instance references is not ready")
+	}
+	return retryable, err
 }
 
 func resolveInstanceImage(instance *compute.Instance) string {
@@ -483,12 +654,82 @@ func orderInstanceTypesByPrice(instanceTypes []*cloudprovider.InstanceType, requ
 		if len(instanceTypes[j].Offerings.Available().Compatible(requirements)) > 0 {
 			jPrice = instanceTypes[j].Offerings.Available().Compatible(requirements).Cheapest().Price
 		}
-		if iPrice == jPrice {
+		if iPrice != jPrice {
+			return iPrice < jPrice
+		}
+		if instanceTypes[i].Name != instanceTypes[j].Name {
 			return instanceTypes[i].Name < instanceTypes[j].Name
 		}
-		return iPrice < jPrice
+		return variantSSDCount(instanceTypes[i]) < variantSSDCount(instanceTypes[j])
 	})
 	return instanceTypes
+}
+
+func instanceTypesForLaunch(nodeClaim *karpv1.NodeClaim, instanceTypes []*cloudprovider.InstanceType) ([]*cloudprovider.InstanceType, bool) {
+	exactCount, defaultZero, hasExactCount := requestedLocalSSDCount(nodeClaim)
+	rejectedConfigurable := false
+	filtered := lo.Filter(instanceTypes, func(instanceType *cloudprovider.InstanceType, _ int) bool {
+		if !localssd.FamilySupportsConfigurableLocalSSDs(instanceType.Name) {
+			return true
+		}
+		variantCount, err := resolveCreateSSDCount(instanceType)
+		if err != nil {
+			return true
+		}
+		allowed := (defaultZero && variantCount == 0) || (hasExactCount && variantCount == exactCount)
+		rejectedConfigurable = rejectedConfigurable || !allowed
+		return allowed
+	})
+	return filtered, rejectedConfigurable
+}
+
+func requestedLocalSSDCount(nodeClaim *karpv1.NodeClaim) (int, bool, bool) {
+	requirements := scheduling.NewNodeSelectorRequirementsWithMinValues(nodeClaim.Spec.Requirements...)
+	countRequirement, hasCount := requirements[v1alpha1.LabelInstanceLocalSsdCount]
+	if !hasCount {
+		return 0, true, false
+	}
+	if countRequirement.Operator() != corev1.NodeSelectorOpIn || countRequirement.Len() != 1 {
+		return 0, false, false
+	}
+	count, err := strconv.Atoi(countRequirement.Any())
+	return count, false, err == nil && count >= 0
+}
+
+func validateLaunchInstanceTypes(instanceTypes []*cloudprovider.InstanceType, rejectedConfigurable bool) ([]*cloudprovider.InstanceType, error) {
+	if len(instanceTypes) != 0 {
+		return instanceTypes, nil
+	}
+	if rejectedConfigurable {
+		// Core deletes InsufficientCapacityError NodeClaims immediately. No offering is marked unavailable.
+		return nil, cloudprovider.NewInsufficientCapacityError(fmt.Errorf(
+			"configurable local SSD launches require %s to resolve to one exact count, or to be absent with a count=0 variant that fits the request",
+			v1alpha1.LabelInstanceLocalSsdCount,
+		))
+	}
+	return nil, fmt.Errorf("no instance types remained after applying launch requirements")
+}
+
+func resolveCreateSSDCount(it *cloudprovider.InstanceType) (int, error) {
+	req := it.Requirements.Get(v1alpha1.LabelInstanceLocalSsdCount)
+	if req.Operator() != corev1.NodeSelectorOpIn || req.Len() != 1 {
+		return 0, fmt.Errorf("instance type %s has no single-valued %s requirement; every variant must pin exactly one count",
+			it.Name, v1alpha1.LabelInstanceLocalSsdCount)
+	}
+	n, err := strconv.Atoi(req.Any())
+	if err != nil || n < 0 {
+		return 0, fmt.Errorf("instance type %s %s value %q is not a non-negative integer; every variant must pin an integer count",
+			it.Name, v1alpha1.LabelInstanceLocalSsdCount, req.Any())
+	}
+	return n, nil
+}
+
+func variantSSDCount(it *cloudprovider.InstanceType) int {
+	n, err := resolveCreateSSDCount(it)
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 func filterZonesByRequirement(zones []string, reqs scheduling.Requirements) []string {
@@ -560,7 +801,7 @@ func (p *DefaultProvider) selectZone(ctx context.Context, nodeClaim *karpv1.Node
 
 	// Skip zones with known ICE for this instance type and capacity type.
 	// Without this filter, every retry calls MarkUnavailable and resets the
-	// 30-min TTL, preventing natural expiry. Applied to both on-demand and
+	// TTL, preventing natural expiry. Applied to both on-demand and
 	// spot so both paths behave consistently.
 	zones = lo.Filter(zones, func(z string, _ int) bool {
 		return !p.unavailableOfferings.IsUnavailable(instanceType.Name, z, capacityType)
@@ -580,19 +821,25 @@ func (p *DefaultProvider) selectZone(ctx context.Context, nodeClaim *karpv1.Node
 }
 
 func (p *DefaultProvider) renderDiskProperties(instanceType *cloudprovider.InstanceType,
-	nodeClass *v1alpha1.GCENodeClass, zone string,
+	nodeClass *v1alpha1.GCENodeClass, zone string, ssdCount int,
 ) ([]*compute.AttachedDisk, error) {
 	disks := nodeClass.Spec.Disks
 	sort.Slice(disks, func(i, j int) bool {
 		return disks[i].Boot
 	})
 
-	attachedDisks := make([]*compute.AttachedDisk, len(disks))
-	for i, disk := range disks {
+	attachedDisks := make([]*compute.AttachedDisk, 0, len(disks)+ssdCount)
+	for _, disk := range disks {
+		if disk.Category == "local-ssd" {
+			continue
+		}
 		// Create a new disk configuration for each disk to avoid sharing references
 		initParams := &compute.AttachedDiskInitializeParams{
-			DiskType:   fmt.Sprintf("projects/%s/zones/%s/diskTypes/%s", p.projectID, zone, disk.Category),
 			DiskSizeGb: int64(disk.SizeGiB),
+			Labels:     maps.Clone(nodeClass.Spec.Labels),
+		}
+		if disk.Category != "" {
+			initParams.DiskType = fmt.Sprintf("projects/%s/zones/%s/diskTypes/%s", p.projectID, zone, disk.Category)
 		}
 		if disk.ProvisionedIOPS != nil {
 			initParams.ProvisionedIops = *disk.ProvisionedIOPS
@@ -633,14 +880,38 @@ func (p *DefaultProvider) renderDiskProperties(instanceType *cloudprovider.Insta
 			}
 		}
 
-		attachedDisks[i] = attachedDisk
+		attachedDisks = append(attachedDisks, attachedDisk)
 	}
 
+	attachedDisks = append(attachedDisks, p.localSSDDisks(instanceType.Name, zone, ssdCount)...)
 	return attachedDisks, nil
 }
 
-func (p *DefaultProvider) buildInstance(ctx context.Context, nodeClaim *karpv1.NodeClaim, nodeClass *v1alpha1.GCENodeClass, instanceType *cloudprovider.InstanceType, sourceMetadata *compute.Metadata, clusterConfig *container.Cluster, zone, instanceName, capacityType string) (*compute.Instance, error) {
-	attachedDisks, err := p.renderDiskProperties(instanceType, nodeClass, zone)
+func (p *DefaultProvider) localSSDDisks(instanceType, zone string, count int) []*compute.AttachedDisk {
+	if !localssd.FamilySupportsConfigurableLocalSSDs(instanceType) {
+		return nil
+	}
+	disks := make([]*compute.AttachedDisk, count)
+	for i := range count {
+		disks[i] = p.scratchDisk(zone)
+	}
+	return disks
+}
+
+func (p *DefaultProvider) scratchDisk(zone string) *compute.AttachedDisk {
+	return &compute.AttachedDisk{
+		Type:       "SCRATCH",
+		AutoDelete: true,
+		Boot:       false,
+		Interface:  "NVME",
+		InitializeParams: &compute.AttachedDiskInitializeParams{
+			DiskType: fmt.Sprintf("projects/%s/zones/%s/diskTypes/local-ssd", p.projectID, zone),
+		},
+	}
+}
+
+func (p *DefaultProvider) buildInstance(ctx context.Context, nodeClaim *karpv1.NodeClaim, nodeClass *v1alpha1.GCENodeClass, instanceType *cloudprovider.InstanceType, sourceMetadata *compute.Metadata, clusterConfig *container.Cluster, zone, instanceName, capacityType string, mt *computepb.MachineType, ssdCount int) (*compute.Instance, error) {
+	attachedDisks, err := p.renderDiskProperties(instanceType, nodeClass, zone, ssdCount)
 	if err != nil {
 		return nil, fmt.Errorf("rendering disk properties: %w", err)
 	}
@@ -648,7 +919,7 @@ func (p *DefaultProvider) buildInstance(ctx context.Context, nodeClaim *karpv1.N
 	isGPUInstance := instanceTypeHasGPU(instanceType)
 
 	// Setup metadata
-	instanceMetadata, err := p.setupInstanceMetadata(ctx, sourceMetadata, nodeClass, instanceType, nodeClaim, zone, capacityType, isGPUInstance)
+	instanceMetadata, err := p.setupInstanceMetadata(ctx, sourceMetadata, nodeClass, instanceType, nodeClaim, zone, capacityType, isGPUInstance, ssdCount)
 	if err != nil {
 		return nil, fmt.Errorf("setting up instance metadata: %w", err)
 	}
@@ -670,7 +941,7 @@ func (p *DefaultProvider) buildInstance(ctx context.Context, nodeClaim *karpv1.N
 		ServiceAccounts:   serviceAccounts,
 		Metadata:          computeMetadata,
 		Labels:            instanceMetadata.ToComputeInstanceLabels(),
-		Scheduling:        setupScheduling(capacityType),
+		Scheduling:        setupScheduling(capacityType, nodeClass),
 		Tags:              buildInstanceTags(p.clusterName, clusterConfig.Id, nodeClass.Spec.NetworkTags),
 	}
 
@@ -695,15 +966,18 @@ func (p *DefaultProvider) buildInstance(ctx context.Context, nodeClaim *karpv1.N
 	// Configure capacity provision
 	p.configureInstanceCapacityProvision(instance, capacityType)
 
-	// A2, A3, G2 machine types have built-in GPUs and do not support live migration.
-	if isGPUInstance {
-		instance.Scheduling.OnHostMaintenance = "TERMINATE"
+	if policy := onHostMaintenancePolicy(instanceType, capacityType, mt); policy != "" {
+		instance.Scheduling.OnHostMaintenance = policy
 	}
 
+	// Configure confidential instance
 	p.configureConfidentialInstance(instance, nodeClass)
 
+	// Configure advanced machine features
+	p.configureAdvancedMachineFeatures(instance, nodeClass)
+
 	// Setup karpenter built-in labels
-	p.setupInstanceLabels(instance, nodeClaim, nodeClass, clusterConfig.Id)
+	p.setupInstanceLabels(instance, nodeClaim, nodeClass, clusterConfig.Id, ssdCount)
 
 	return instance, nil
 }
@@ -715,29 +989,23 @@ func (p *DefaultProvider) setupNetworkInterfaces(cluster *container.Cluster, nod
 	targetRange := podCIDRRange(nodeClass.GetMaxPods())
 	clusterPrivate := cluster.PrivateClusterConfig != nil && cluster.PrivateClusterConfig.EnablePrivateNodes
 
-	// Pod CIDR range name: NodeClass → cluster IpAllocationPolicy → let GKE pick.
 	rangeName := ""
-	if nodeClass.Spec.SubnetRangeName != nil {
-		rangeName = *nodeClass.Spec.SubnetRangeName
-	} else if cluster.IpAllocationPolicy != nil {
-		rangeName = cluster.IpAllocationPolicy.ClusterSecondaryRangeName
+	if names := resolvedPodRangeNames(nodeClass, cluster); len(names) > 0 {
+		rangeName = names[0]
 	}
 
 	// Primary interface: built from cluster config, overrideable via NodeClass networkConfig.
-	subnetwork := cluster.NetworkConfig.Subnetwork
+	network, subnetwork := subnet.PrimaryNetwork(nodeClass, cluster)
 	disableExternal := clusterPrivate
 	if nodeClass.Spec.NetworkConfig != nil {
 		cfg := nodeClass.Spec.NetworkConfig
-		if cfg.Subnetwork != "" {
-			subnetwork = cfg.Subnetwork
-		}
 		if cfg.EnablePrivateNodes != nil {
 			disableExternal = *cfg.EnablePrivateNodes
 		}
 	}
 
 	primary := &compute.NetworkInterface{
-		Network:    cluster.NetworkConfig.Network,
+		Network:    network,
 		Subnetwork: subnetwork,
 		AliasIpRanges: []*compute.AliasIpRange{{
 			IpCidrRange:         fmt.Sprintf("/%d", targetRange),
@@ -805,9 +1073,12 @@ func podCIDRRange(maxPods int32) int32 {
 }
 
 // setupInstanceMetadata configures all metadata-related settings for the instance.
-func (p *DefaultProvider) setupInstanceMetadata(ctx context.Context, sourceMetadata *compute.Metadata, nodeClass *v1alpha1.GCENodeClass, instanceType *cloudprovider.InstanceType, nodeClaim *karpv1.NodeClaim, zone string, capacityType string, isGPUInstance bool) (*metadata.InstanceMetadata, error) {
+func (p *DefaultProvider) setupInstanceMetadata(ctx context.Context, sourceMetadata *compute.Metadata, nodeClass *v1alpha1.GCENodeClass, instanceType *cloudprovider.InstanceType, nodeClaim *karpv1.NodeClaim, zone string, capacityType string, isGPUInstance bool, ssdCount int) (*metadata.InstanceMetadata, error) {
 	target, err := metadata.FromSourceTemplate(sourceMetadata)
 	if err != nil {
+		return nil, err
+	}
+	if err := validateSourceKubeEnv(target); err != nil {
 		return nil, err
 	}
 	target.SetCustomMetadata(metadata.CustomMetadata(nodeClass.Spec.Metadata))
@@ -818,6 +1089,7 @@ func (p *DefaultProvider) setupInstanceMetadata(ctx context.Context, sourceMetad
 	target.SetKubeEnvEntry("ZONE", zone)
 	patchKubeEnvOSDistribution(target, nodeClass)
 	patchSecondaryBootDisksKubeEnv(target, nodeClass)
+	patchHugepagesKubeEnv(target, nodeClass)
 	target.UpdateKubeletConfig(func(config *kubeletconfig.KubeletConfiguration) {
 		applyInstanceTypeKubeReserved(config, instanceType)
 		applyNodeClassKubeletConfig(config, nodeClass.Spec.KubeletConfiguration)
@@ -827,6 +1099,7 @@ func (p *DefaultProvider) setupInstanceMetadata(ctx context.Context, sourceMetad
 		return nil, err
 	}
 	p.buildTargetMetadata(ctx, target, sourceMetadata, nodeClass, instanceType, nodeClaim, provisioningModel, isGPUInstance)
+	patchLocalSSDMetadata(target, nodeClass, ssdCount)
 
 	return target, nil
 }
@@ -875,6 +1148,35 @@ func (p *DefaultProvider) buildTargetMetadata(ctx context.Context, target *metad
 		target.SetKubeLabel(key, value)
 		target.SetRegistrationNodeLabel(key, value)
 	}
+}
+
+// Local SSD metadata consumed by the GKE bootstrapper.
+const (
+	kubeEnvKeyLocalNVMeBlockExt        = "NODE_LOCAL_NVME_SSD_BLOCK_EXT"
+	kubeEnvKeyEphemeralStorageLocalSSD = "NODE_EPHEMERAL_STORAGE_LOCAL_SSD"
+	kubeLabelKeyLocalNVMe              = "cloud.google.com/gke-local-nvme-ssd"
+	kubeLabelKeyEphemeralLS            = "cloud.google.com/gke-ephemeral-storage-local-ssd"
+)
+
+func patchLocalSSDMetadata(target *metadata.InstanceMetadata, nodeClass *v1alpha1.GCENodeClass, ssdCount int) {
+	if ssdCount <= 0 {
+		return
+	}
+	var envKey, envValue, envDrop, labelKey string
+	switch nodeClass.Spec.LocalSsdMode {
+	case v1alpha1.LocalSSDModeEphemeral:
+		envKey, envValue = kubeEnvKeyEphemeralStorageLocalSSD, "true"
+		envDrop = kubeEnvKeyLocalNVMeBlockExt
+		labelKey = kubeLabelKeyEphemeralLS
+	default:
+		envKey, envValue = kubeEnvKeyLocalNVMeBlockExt, fmt.Sprintf("%d,nvme,block", ssdCount)
+		envDrop = kubeEnvKeyEphemeralStorageLocalSSD
+		labelKey = kubeLabelKeyLocalNVMe
+	}
+	target.UnsetKubeEnvEntry(envDrop)
+	target.SetKubeEnvEntry(envKey, envValue)
+	target.SetKubeLabel(labelKey, "true")
+	target.SetRegistrationNodeLabel(labelKey, "true")
 }
 
 // instanceTypeHasGPU reports whether the instance type has a built-in GPU requirement.
@@ -1035,14 +1337,18 @@ func (p *DefaultProvider) setupServiceAccounts(nodeClass *v1alpha1.GCENodeClass)
 	}, nil
 }
 
-// setupScheduling returns scheduling config derived from capacity type alone.
-// Spot-specific fields (provisioning model, preemptibility) are set later by
-// configureInstanceCapacityProvision; this only wires the termination action so
-// GCE honors DELETE rather than the default STOP on preemption.
-func setupScheduling(capacityType string) *compute.Scheduling {
+// setupScheduling returns scheduling config derived from capacity type and the
+// NodeClass. Spot-specific fields (provisioning model, preemptibility) are set
+// later by configureInstanceCapacityProvision; this wires the termination action
+// so GCE honors DELETE rather than the default STOP on preemption, and the
+// preemption notice duration when the NodeClass asks for one.
+func setupScheduling(capacityType string, nodeClass *v1alpha1.GCENodeClass) *compute.Scheduling {
 	sched := &compute.Scheduling{}
 	if capacityType == karpv1.CapacityTypeSpot {
 		sched.InstanceTerminationAction = instanceTerminationActionDelete
+		if notice := nodeClass.Spec.PreemptionNoticeDuration; notice != nil && notice.Duration > 0 {
+			sched.PreemptionNoticeDuration = &compute.Duration{Seconds: int64(notice.Seconds())}
+		}
 	}
 	return sched
 }
@@ -1052,9 +1358,7 @@ func setupScheduling(capacityType string) *compute.Scheduling {
 // be inherited by the provisioned instance.
 func initializeInstanceLabels(nodeClass *v1alpha1.GCENodeClass) map[string]string {
 	labels := make(map[string]string)
-	for k, v := range nodeClass.Spec.Labels {
-		labels[k] = v
-	}
+	maps.Copy(labels, nodeClass.Spec.Labels)
 	return labels
 }
 
@@ -1073,8 +1377,37 @@ func (p *DefaultProvider) configureInstanceCapacityProvision(instance *compute.I
 		instance.Scheduling.ProvisioningModel = "SPOT"
 		instance.Scheduling.Preemptible = true
 		instance.Scheduling.AutomaticRestart = ptr.To(false)
-		instance.Scheduling.OnHostMaintenance = "TERMINATE"
 	}
+}
+
+// GCE requires z3 instances with more than 18 TiB of bundled local SSD to terminate on maintenance.
+const z3HighSsdGiBThreshold = 18 * 1024
+
+// onHostMaintenancePolicy returns TERMINATE for shapes that GCE cannot live-migrate.
+func onHostMaintenancePolicy(instanceType *cloudprovider.InstanceType, capacityType string, mt *computepb.MachineType) string {
+	if capacityType == karpv1.CapacityTypeSpot {
+		return "TERMINATE"
+	}
+	if instanceType.Requirements.Get(v1alpha1.LabelInstanceGPUCount).Len() > 0 {
+		return "TERMINATE"
+	}
+	if strings.HasPrefix(instanceType.Name, "z3-") && !strings.HasSuffix(instanceType.Name, "-metal") {
+		if mt != nil {
+			if bls := mt.GetBundledLocalSsds(); bls != nil && bls.PartitionCount != nil {
+				if localssd.TotalGiB(instanceType.Name, int(*bls.PartitionCount)) > z3HighSsdGiBThreshold {
+					return "TERMINATE"
+				}
+			}
+		}
+		return "MIGRATE"
+	}
+	if strings.HasSuffix(instanceType.Name, "-metal") {
+		return "TERMINATE"
+	}
+	if strings.HasPrefix(instanceType.Name, "h4d-") {
+		return "TERMINATE"
+	}
+	return ""
 }
 
 // configureConfidentialInstance applies the NodeClass ConfidentialInstanceType
@@ -1094,10 +1427,24 @@ func (p *DefaultProvider) configureConfidentialInstance(instance *compute.Instan
 	instance.Scheduling.OnHostMaintenance = "TERMINATE"
 }
 
+// configureAdvancedMachineFeatures passes advanced machine features to the GCE
+// instance. Currently this only contains EnableNestedVirtualization which
+// allows access to KVM on certain GCE machine types
+func (p *DefaultProvider) configureAdvancedMachineFeatures(instance *compute.Instance, nodeClass *v1alpha1.GCENodeClass) {
+	amf := nodeClass.Spec.AdvancedMachineFeatures
+	if amf == nil || amf.EnableNestedVirtualization == nil {
+		return
+	}
+	instance.AdvancedMachineFeatures = &compute.AdvancedMachineFeatures{
+		EnableNestedVirtualization: *amf.EnableNestedVirtualization,
+		ForceSendFields:            []string{"EnableNestedVirtualization"},
+	}
+}
+
 // setupInstanceLabels writes controller-owned GCE labels for a new instance.
 // Kubernetes node labels are rebuilt separately in bootstrap metadata and must
 // not be copied to GCE instance labels.
-func (p *DefaultProvider) setupInstanceLabels(instance *compute.Instance, nodeClaim *karpv1.NodeClaim, nodeClass *v1alpha1.GCENodeClass, clusterID string) {
+func (p *DefaultProvider) setupInstanceLabels(instance *compute.Instance, nodeClaim *karpv1.NodeClaim, nodeClass *v1alpha1.GCENodeClass, clusterID string, ssdCount int) {
 	if id, ok := clusterIDBase32(clusterID); ok {
 		instance.Labels["goog-gke-cluster-id-base32"] = id
 	}
@@ -1112,6 +1459,7 @@ func (p *DefaultProvider) setupInstanceLabels(instance *compute.Instance, nodeCl
 	// is checked by belongsToCluster to distinguish same-named clusters in different locations.
 	instance.Labels[utils.SanitizeGCELabelValue(utils.LabelClusterNameKey)] = p.clusterName
 	instance.Labels[utils.SanitizeGCELabelValue(utils.LabelClusterLocationKey)] = p.clusterLocation
+	instance.Labels[utils.SanitizeGCELabelValue(v1alpha1.LabelInstanceLocalSsdCount)] = strconv.Itoa(ssdCount)
 }
 
 func clusterIDBase32(clusterID string) (string, bool) {
@@ -1291,9 +1639,7 @@ func (p *DefaultProvider) CreateTags(ctx context.Context, providerID string, tag
 	if newLabels == nil {
 		newLabels = make(map[string]string)
 	}
-	for k, v := range tags {
-		newLabels[k] = v
-	}
+	maps.Copy(newLabels, tags)
 
 	req := &compute.InstancesSetLabelsRequest{
 		Labels:           newLabels,
@@ -1332,8 +1678,7 @@ func parseGCEProviderID(providerID string) (project, zone, instance string, err 
 }
 
 func isInstanceNotFoundError(err error) bool {
-	var apiErr *googleapi.Error
-	if errors.As(err, &apiErr) {
+	if apiErr, ok := errors.AsType[*googleapi.Error](err); ok {
 		return apiErr.Code == 404
 	}
 	return false

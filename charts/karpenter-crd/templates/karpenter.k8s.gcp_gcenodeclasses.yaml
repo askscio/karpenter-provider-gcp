@@ -6,7 +6,7 @@ metadata:
     {{- with .Values.additionalAnnotations }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
-    controller-gen.kubebuilder.io/version: v0.21.0
+    controller-gen.kubebuilder.io/version: v0.22.0
   name: gcenodeclasses.karpenter.k8s.gcp
 spec:
   group: karpenter.k8s.gcp
@@ -56,6 +56,17 @@ spec:
               GCENodeClassSpec is the top level specification for the GCP Karpenter Provider.
               This will contain the configuration necessary to launch instances in GCP.
             properties:
+              advancedMachineFeatures:
+                description: AdvancedMachineFeatures configures advanced CPU and virtualisation
+                  options for provisioned nodes.
+                properties:
+                  enableNestedVirtualization:
+                    description: |-
+                      EnableNestedVirtualization defines whether the instance can run nested virtual machines.
+                      Only supported on Intel-based machine families; not supported on E2, AMD, Arm or
+                      Confidential VM instances.
+                    type: boolean
+                type: object
               autoGPUTaint:
                 description: |-
                   AutoGPUTaint, when true, automatically applies nvidia.com/gpu=present:NoSchedule
@@ -88,7 +99,6 @@ spec:
                       - hyperdisk-extreme
                       - hyperdisk-ml
                       - hyperdisk-throughput
-                      - local-ssd
                       - pd-balanced
                       - pd-extreme
                       - pd-ssd
@@ -385,6 +395,16 @@ spec:
                       rule: self.all(x, !self[x].startsWith('-'))
                     - message: kubeReserved values must be a resource.Quantity
                       rule: self.all(x, self[x].matches('^(\\+|-)?(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\\+|-)?(([0-9]+(\\.[0-9]*)?)|(\\.[0-9]+))))?$'))
+                  maxParallelImagePulls:
+                    description: |-
+                      MaxParallelImagePulls sets the maximum number of image pulls in parallel.
+                      Values above 1 require SerializeImagePulls to be explicitly set to false.
+                      Nodes with many DaemonSets pulling cold images concurrently (a common case
+                      right after a fresh node joins the cluster) benefit most from raising this
+                      above the kubelet default of 1.
+                    format: int32
+                    minimum: 1
+                    type: integer
                   maxPods:
                     description: |-
                       MaxPods is an override for the maximum number of pods that can run on
@@ -400,6 +420,12 @@ spec:
                     format: int32
                     minimum: 0
                     type: integer
+                  serializeImagePulls:
+                    description: |-
+                      SerializeImagePulls, when enabled, tells the kubelet to pull images one at a
+                      time. Must be explicitly set to false to set MaxParallelImagePulls above 1.
+                      Default: true
+                    type: boolean
                   systemReserved:
                     additionalProperties:
                       description: KubeletQuantity is a bounded kubelet resource quantity
@@ -431,10 +457,17 @@ spec:
                     evictionSoft
                   rule: has(self.evictionSoftGracePeriod) ? self.evictionSoftGracePeriod.all(e,
                     (e in self.evictionSoft)):true
+                - message: maxParallelImagePulls greater than 1 requires serializeImagePulls
+                    to be explicitly set to false
+                  rule: '!has(self.maxParallelImagePulls) || self.maxParallelImagePulls
+                    < 2 || (has(self.serializeImagePulls) && self.serializeImagePulls
+                    == false)'
               labels:
                 additionalProperties:
                   type: string
-                description: Labels to be applied on GCE VM instance.
+                description: |-
+                  Labels to be applied on the GCE VM instance and its persistent disks.
+                  Local SSD scratch disks do not support labels.
                 maxProperties: 20
                 type: object
                 x-kubernetes-validations:
@@ -450,6 +483,38 @@ spec:
                   rule: self.all(k, k !='karpenter.sh/nodeclaim')
                 - message: tag contains a restricted tag matching karpenter.k8s.gcp/gcenodeclass
                   rule: self.all(k, k !='karpenter.k8s.gcp/gcenodeclass')
+              linuxNodeConfig:
+                description: |-
+                  LinuxNodeConfig configures the Linux kernel of provisioned nodes.
+                  Mirrors GKE node pool linux_node_config.
+                properties:
+                  hugepages:
+                    description: |-
+                      Hugepages configures the static hugepages that the node allocates at boot.
+                      Mirrors GKE node pool linux_node_config.hugepages_config.
+                    properties:
+                      hugepageSize1g:
+                        description: HugepageSize1g is the number of 1 GiB hugepages
+                          to allocate.
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      hugepageSize2m:
+                        description: HugepageSize2m is the number of 2 MiB hugepages
+                          to allocate.
+                        format: int32
+                        minimum: 1
+                        type: integer
+                    type: object
+                type: object
+              localSsdMode:
+                default: RawBlock
+                description: LocalSsdMode exposes local SSDs as raw devices or kubelet
+                  ephemeral storage.
+                enum:
+                - RawBlock
+                - Ephemeral
+                type: string
               metadata:
                 additionalProperties:
                   type: string
@@ -528,6 +593,21 @@ spec:
                   type: string
                 maxItems: 20
                 type: array
+              preemptionNoticeDuration:
+                description: |-
+                  PreemptionNoticeDuration is how long before shutdown GCE flips the
+                  instance/preempted metadata key on a Spot VM. Unset (the default) gives no advance
+                  notice: the key flips at the same moment the ACPI G2 Soft Off signal is sent.
+                  "120s" gives a two-minute warning, letting Karpenter start draining before shutdown.
+                  GCE currently accepts up to two minutes.
+                  Only applies to Spot capacity; ignored for on-demand nodes.
+                  Reading the notice requires an agent on the node that watches the metadata key
+                  and sets the GCESpotPreempting condition — see docs/spot-preemption.md.
+                pattern: ^([0-9]+(s|m|h))+$
+                type: string
+                x-kubernetes-validations:
+                - message: preemptionNoticeDuration must not exceed 120s
+                  rule: duration(self) <= duration('120s')
               serviceAccount:
                 description: ServiceAccount is the GCP IAM service account email to
                   assign to the instance
@@ -554,16 +634,40 @@ spec:
               subnetRangeName:
                 description: |-
                   SubnetRangeName is the name of the subnetwork secondary IPv4 range from which
-                  to allocate pod IP addresses (alias IPs for pods). If not specified, the cluster's
-                  default pod secondary range (ClusterSecondaryRangeName from the cluster's IP
-                  allocation policy) is used.
+                  to allocate pod IP addresses (alias IPs for pods). When set, only this range is
+                  considered. Mutually exclusive with subnetRangeNames. If neither field is set,
+                  the cluster's default and additional pod ranges on its primary subnetwork are used.
+
+                  Deprecated: use SubnetRangeNames with a single entry instead.
                 maxLength: 63
                 minLength: 1
                 pattern: ^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$
                 type: string
+              subnetRangeNames:
+                description: |-
+                  SubnetRangeNames is a list of subnetwork secondary IPv4 range names from which
+                  to allocate pod IP addresses (alias IPs for pods). When more than one name is
+                  listed, the provider prefers the range with the most Compute-reported free IPv4 addresses
+                  at launch. Mutually exclusive with subnetRangeName. When set, this list replaces
+                  the cluster defaults completely. If neither field is set, the cluster's default
+                  and additional pod ranges on its primary subnetwork are used.
+                items:
+                  maxLength: 63
+                  minLength: 1
+                  pattern: ^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$
+                  type: string
+                maxItems: 16
+                minItems: 1
+                type: array
+                x-kubernetes-validations:
+                - message: subnetRangeNames must be unique
+                  rule: self.all(x, self.exists_one(y, x == y))
             required:
             - imageSelectorTerms
             type: object
+            x-kubernetes-validations:
+            - message: subnetRangeName and subnetRangeNames are mutually exclusive
+              rule: '!(has(self.subnetRangeName) && has(self.subnetRangeNames))'
           status:
             description: GCENodeClassStatus contains the resolved state of the GCENodeClass
             properties:
@@ -674,6 +778,29 @@ spec:
                   required:
                   - requirements
                   - sourceImage
+                  type: object
+                type: array
+              subnetRanges:
+                description: |-
+                  SubnetRanges contains the pod secondary IPv4 ranges considered for launch
+                  and their Compute-reported free IPv4 address counts when known.
+                items:
+                  description: SubnetRangeStatus is a resolved pod secondary range
+                    considered for node launch.
+                  properties:
+                    name:
+                      description: Name is the subnetwork secondary IPv4 range name.
+                      type: string
+                    totalFreeIP:
+                      description: |-
+                        TotalFreeIP is the Compute-reported number of free IPv4 addresses in this
+                        secondary range. Omitted when unknown; zero means no free addresses were reported.
+                        Counts are snapshots, not a guarantee of an allocatable contiguous pod CIDR block.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                  required:
+                  - name
                   type: object
                 type: array
             type: object

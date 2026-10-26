@@ -8,12 +8,14 @@ For an overview of selection modes (channel tracking, version pin, raw image ID)
 
 ## Finding Available Versions
 
+Karpenter only selects images whose GCE status is `READY`. The commands below apply the same filter, so an image that GCP is still publishing doesn't appear until you can use it.
+
 **ContainerOptimizedOS** — replace `1351` with your K8s version digits (e.g. 1.35.1 → 1351):
 
 ```bash
 gcloud compute images list \
   --project=gke-node-images \
-  --filter="name~'^gke-1351-.*-cos-[0-9].*-c-pre$' AND NOT deprecated:*" \
+  --filter="name~'^gke-1351-.*-cos-[0-9].*-c-pre$' AND NOT deprecated:* AND status=READY" \
   --format="value(name)" \
   | sed 's/.*-cos-\([0-9][0-9]*-[0-9][0-9]*-[0-9][0-9]*-[0-9][0-9]*\)-c-pre/\1/' \
   | tr '-' '.' | sort -u
@@ -31,17 +33,40 @@ Sample output:
 ```bash
 gcloud compute images list \
   --project=ubuntu-os-gke-cloud \
-  --filter="name~'^ubuntu-gke-2404-1-35-amd64-v[0-9].*$' AND NOT deprecated:*" \
+  --filter="name~'^ubuntu-gke-2404-1-35-amd64-v[0-9]+[a-z]?$' AND NOT deprecated:* AND status=READY" \
   --format="value(name)" \
-  | sed 's/.*-\(v[0-9][0-9]*\)$/\1/' | sort -u
+  | grep -oE 'v[0-9]+[a-z]?$' | sort -u
 ```
 
 Sample output:
 
 ```
 v20260401
-v20260416
+v20260416a
 ```
+
+For arm64, change the arch token in the filter (`amd64` → `arm64`):
+
+```bash
+gcloud compute images list \
+  --project=ubuntu-os-gke-cloud \
+  --filter="name~'^ubuntu-gke-2404-1-35-arm64-v[0-9]+[a-z]?$' AND NOT deprecated:* AND status=READY" \
+  --format="value(name)" \
+  | grep -oE 'v[0-9]+[a-z]?$' | sort -u
+```
+
+Sample output:
+
+```
+v20260408
+v20260420a
+```
+
+For Ubuntu 22.04, the `ubuntu-gke-2204` amd64 image names do not carry an `-amd64-` token. Drop the arch token from the amd64 filter: use `^ubuntu-gke-2204-1-35-v[0-9]+[a-z]?$` for amd64 and `^ubuntu-gke-2204-1-35-arm64-v[0-9]+[a-z]?$` for arm64.
+
+> **Note:** A date shown with a trailing letter (for example, `v20260416a`) is a re-spin that `version: latest` can select, but it is not a valid `version:` pin — pins must be a bare `vYYYYMMDD`. Pin only dates that appear without a trailing letter.
+
+> **Note:** For Ubuntu families, Karpenter resolves both architectures independently from the catalog, so both an amd64 image and an arm64 image must exist for the cluster's Kubernetes minor version before any NodePool referencing the GCENodeClass can become ready. If either image is missing, the GCENodeClass's `ImagesReady` condition reports `ImageResolutionFailed`. See [Troubleshooting: GCENodeClass not becoming Ready](troubleshooting.md#gcenodeclass-not-becoming-ready).
 
 ## Controlling Image Replacement
 

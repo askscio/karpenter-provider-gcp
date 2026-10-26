@@ -38,7 +38,12 @@
     "additionalAnnotations": {
       "type": "object",
       "additionalProperties": { "type": "string" },
-      "description": "Additional annotations added to all resources."
+      "description": "Additional annotations to add into metadata for templated resources (excludes CRDs)"
+    },
+    "additionalLabels": {
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "description": "Additional labels to add into metadata for templated resources (excludes CRDs). Labels that the chart adds by default will not be overridden by these additional labels."
     },
     "imagePullSecrets": {
       "type": "array",
@@ -308,6 +313,11 @@
               "type": "boolean",
               "description": "Enable scheduling to reserved/committed GCP capacity. Disabled by default: GCE reservation support is not yet implemented (see #239).",
               "default": false
+            },
+            "capacityBuffer": {
+              "type": "boolean",
+              "description": "Enable CapacityBuffer support (alpha) for pre-provisioning spare capacity.",
+              "default": false
             }
           }
         },
@@ -323,6 +333,11 @@
         "tolerations": {
           "type": "array",
           "description": "Tolerations for the controller pod.",
+          "items": { "type": "object" }
+        },
+        "topologySpreadConstraints": {
+          "type": "array",
+          "description": "Topology spread constraints for the controller pod.",
           "items": { "type": "object" }
         },
         "settings": {
@@ -368,6 +383,12 @@
               "description": "When true, Karpenter ignores pods' Dynamic Resource Allocation requests during scheduling simulations.",
               "default": true
             },
+            "preferencePolicy": {
+              "type": "string",
+              "enum": ["Respect", "Ignore"],
+              "description": "How Karpenter handles soft scheduling preferences. Respect preserves them; Ignore disregards preferred node/pod affinity and anti-affinity plus ScheduleAnyway topology spread constraints.",
+              "default": "Respect"
+            },
             "defaultNodePoolTemplateName": {
               "type": "string",
               "description": "Pin the GKE node pool used as the bootstrap metadata source. Leave empty for automatic discovery.",
@@ -379,6 +400,17 @@
               "default": ""
             }
           }
+        }
+      }
+    },
+    "node-problem-detector": {
+      "type": "object",
+      "description": "Values passed to the optional node-problem-detector subchart that runs the Spot preemption plugin. Schema is owned by that chart; only the enable toggle is constrained here.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Deploy node-problem-detector with the Spot preemption plugin.",
+          "default": false
         }
       }
     },

@@ -5,6 +5,80 @@
 
 ## Unreleased
 
+## v0.7.0
+
+### Multiple pod CIDR ranges on GCENodeClass
+
+`GCENodeClass` now accepts `spec.subnetRangeNames`, a list of GKE secondary IPv4 range names for
+pod alias IPs. When more than one name is eligible, Karpenter prefers the range with the most
+Compute-reported free IPv4 addresses and retries remaining names if Compute returns IP space
+exhausted. Resolved names and optional integer `totalFreeIP` counts are published on
+`status.subnetRanges`.
+
+`spec.subnetRangeName` is deprecated but remains supported for backward compatibility.
+Use `spec.subnetRangeNames` instead, even for a single range. The two fields are mutually
+exclusive. Either field completely replaces the discovered range list; overrides are not
+merged with cluster ranges. If neither is set, Karpenter now considers the cluster default
+plus additional pod ranges reported by GKE on the primary subnetwork.
+
+**Recommended migration:** replace `subnetRangeName: pods` with `subnetRangeNames: [pods]`,
+using your existing range name, and remove `subnetRangeName`. No immediate action is required;
+removal of the deprecated field will be announced separately. Migrating from `subnetRangeName`
+to `subnetRangeNames` marks existing nodes as drifted and may cause Karpenter to replace them.
+
+**Default behavior change:** NodeClasses with both fields omitted can now allocate from
+additional cluster pod ranges. To retain default-range-only allocation, set
+`subnetRangeNames: [CLUSTER_DEFAULT_RANGE_NAME]`. Otherwise, omit both fields to use all
+cluster-level ranges, or set `subnetRangeNames` to restrict allocation to specific ranges.
+Ranges on separate additional subnetworks are not discovered.
+
+**Capacity reporting:** `status.subnetRanges[].totalFreeIP` is optional. Zero is a reported
+count; an omitted count means unknown capacity. Counts are cached for one minute and do not
+guarantee an allocatable contiguous pod CIDR block. A failed or timed-out capacity read leaves
+launch order unchanged and clears status counts; allocation still relies on Compute insertion
+and range fallback.
+
+The controller now reads `subnetworks.get` with `WITH_UTILIZATION` for capacity. The custom role
+already includes `compute.subnetworks.get`; ensure the controller also has that permission in
+any Shared VPC host project containing the target subnetwork. No new IAM permission is added.
+
+### New IAM permission required: `compute.machineTypes.get`
+
+Registering a `GCECustomMachineType` requires the controller's service account to have `compute.machineTypes.get`, in addition to the existing `compute.machineTypes.list`. Add it to your controller's IAM role before upgrading; see [`deploy/iam/karpenter-controller-role.yaml`](deploy/iam/karpenter-controller-role.yaml). Without it, every `GCECustomMachineType` registration is treated as a transient failure and retried rather than marked `Ready=False` — it stays stuck at `Ready=Unknown` indefinitely instead of surfacing a clear error, so check the controller logs for `PermissionDenied` if a registration never becomes `Ready`.
+
+### NodeClass labels now apply to newly provisioned persistent disks
+
+`GCENodeClass.spec.labels` now applies to the VM instance and all persistent disks created from `spec.disks`, including the boot disk. Existing disks are not relabeled by this change, and local SSDs and CSI-managed volumes are outside its scope.
+
+**Action required:** update the controller's custom IAM role from [`deploy/iam/karpenter-controller-role.yaml`](deploy/iam/karpenter-controller-role.yaml) before upgrading. Compute Engine requires `compute.disks.setLabels` when creating a disk with labels through `instances.insert`; without it, provisioning fails for NodeClasses with non-empty `spec.labels`.
+
+### Replace the non-working local SSD disk category
+
+`GCENodeClass.spec.disks[].category: local-ssd` never provisioned local SSDs successfully and is no longer accepted by the CRD. If your NodeClass uses it, remove that disk entry before upgrading the CRD. To provision local SSDs, use `spec.localSsdMode` (`RawBlock` by default; set `Ephemeral` for kubelet storage). For configurable machine families (`n1`, `n2`, `n2d`, `c2`, `c2d`), declare `karpenter.k8s.gcp/instance-local-ssd-count` on the NodePool and select one exact count through the NodePool or Pod requirements. Fixed-count local SSD machine types, such as `c4d-standard-8-lssd`, do not need a Pod count selector. See [Proposal 0003](proposals/0003-local-ssd-support.md#migration) for examples.
+
+---
+
+## v0.6.0
+
+### CapacityBuffer requires the CRD to already be installed; the CRD is not installed by this provider
+
+This provider does not ship the `CapacityBuffer` CRD in either the `karpenter` or `karpenter-crd`
+chart. GKE provides it natively starting at `1.35.2-gke.1842000`. Setting
+`controller.featureGates.capacityBuffer: true` now checks the cluster for the CRD
+(`autoscaling.x-k8s.io/v1beta1/CapacityBuffer`) at Helm template time and fails the install/upgrade
+if it isn't present, instead of silently enabling a feature the controller can't back with a CRD.
+
+### Unsupported instance labels removed
+
+The provider no longer registers or exposes the following GCP instance labels:
+
+- `karpenter.k8s.gcp/instance-category`
+- `karpenter.k8s.gcp/instance-cpu-model`
+
+`instance-category` was derived from the leading letters of the machine family, but those letters do not match GCP's machine categories. For example, `c2` and `c2d` are compute-optimized, while `c3`, `c3d`, and `c4` are general-purpose. `instance-cpu-model` was registered but never populated.
+
+**Action required:** remove these labels from NodePool requirements and workload scheduling constraints before upgrading. Use `karpenter.k8s.gcp/instance-family` when you need to target specific GCP machine families.
+
 ---
 
 ## v0.5.0

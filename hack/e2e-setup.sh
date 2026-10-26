@@ -2,26 +2,38 @@
 # e2e-setup.sh — Idempotently creates GCP infra for e2e tests and deploys
 # the karpenter controller via Helm. Reuses existing resources on re-runs.
 #
-# Required:
+# Optional:
 #   GOOGLE_APPLICATION_CREDENTIALS  path to service-account key JSON
+#                                   (not needed if `gcloud auth login` is already active)
 #
 # Optional (with defaults):
-#   E2E_PROJECT_ID    GCP project ID        (default: parsed from credentials)
+#   E2E_PROJECT_ID    GCP project ID        (default: parsed from credentials, else active gcloud config)
 #   E2E_PREFIX        resource name prefix  (default: karpenter-e2e)
 #   E2E_REGION        GCP region            (default: us-central1)
 #   E2E_LOCATION      GCP location (zone or region, e.g. us-central1-f or us-central1)
 #   E2E_MACHINE_TYPE  system node type      (default: n2-standard-2)
 set -euo pipefail
 
-: "${GOOGLE_APPLICATION_CREDENTIALS:?GOOGLE_APPLICATION_CREDENTIALS must be set}"
-
 log() { echo "e2e-setup: $*" >&2; }
 
-# E2E_PROJECT_ID can be set explicitly; if not, extract it from the credentials file.
+if [ -z "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]; then
+  ACTIVE_ACCOUNT="$(gcloud auth list --filter=status:ACTIVE --format='value(account)' 2>/dev/null)"
+  : "${ACTIVE_ACCOUNT:?No active gcloud login found and GOOGLE_APPLICATION_CREDENTIALS is not set. Run 'gcloud auth login' or set GOOGLE_APPLICATION_CREDENTIALS.}"
+  log "Using existing gcloud login: ${ACTIVE_ACCOUNT}"
+fi
+
+# E2E_PROJECT_ID can be set explicitly; if not, extract it from the credentials
+# file, falling back to the active gcloud config.
 if [ -z "${E2E_PROJECT_ID:-}" ]; then
-  E2E_PROJECT_ID="$(python3 -c "import json; print(json.load(open('${GOOGLE_APPLICATION_CREDENTIALS}'))['project_id'])")" \
-    || { echo "ERROR: E2E_PROJECT_ID is not set and could not be parsed from ${GOOGLE_APPLICATION_CREDENTIALS}" >&2; exit 1; }
-  log "Derived E2E_PROJECT_ID=${E2E_PROJECT_ID} from credentials file"
+  if [ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]; then
+    E2E_PROJECT_ID="$(python3 -c "import json; print(json.load(open('${GOOGLE_APPLICATION_CREDENTIALS}'))['project_id'])")" \
+      || { echo "ERROR: E2E_PROJECT_ID is not set and could not be parsed from ${GOOGLE_APPLICATION_CREDENTIALS}" >&2; exit 1; }
+    log "Derived E2E_PROJECT_ID=${E2E_PROJECT_ID} from credentials file"
+  else
+    E2E_PROJECT_ID="$(gcloud config get-value project 2>/dev/null)"
+    : "${E2E_PROJECT_ID:?E2E_PROJECT_ID is not set and could not be derived from the active gcloud config}"
+    log "Derived E2E_PROJECT_ID=${E2E_PROJECT_ID} from gcloud config"
+  fi
 fi
 
 : "${E2E_LOCATION:?E2E_LOCATION must be set (zone, e.g. us-central1-f, or region, e.g. us-central1)}"
@@ -34,6 +46,8 @@ CLUSTER_NAME="${E2E_PREFIX}-cluster"
 NETWORK_NAME="${E2E_PREFIX}-vpc"
 SUBNET_NAME="${E2E_PREFIX}-subnet"
 PODS_RANGE="${E2E_PREFIX}-pods"
+SMALL_PODS_RANGE="${E2E_PREFIX}-pods-small"
+LARGE_PODS_RANGE="${E2E_PREFIX}-pods-large"
 SERVICES_RANGE="${E2E_PREFIX}-services"
 GSA_ID="${E2E_PREFIX}-karpenter"
 GSA_EMAIL="${GSA_ID}@${E2E_PROJECT_ID}.iam.gserviceaccount.com"
@@ -44,15 +58,19 @@ IMAGE_REPO="${E2E_REGION}-docker.pkg.dev/${E2E_PROJECT_ID}/${AR_REPO}/karpenter"
 
 PRIMARY_CIDR="10.0.0.0/20"
 PODS_CIDR="10.4.0.0/14"
+SMALL_PODS_CIDR="10.12.0.0/22"
+LARGE_PODS_CIDR="10.16.0.0/20"
 SERVICES_CIDR="10.8.0.0/20"
 
 REPO_ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
 
-log "Authenticating..."
-gcloud auth activate-service-account \
-  --key-file "${GOOGLE_APPLICATION_CREDENTIALS}" \
-  --project "${E2E_PROJECT_ID}" \
-  --quiet
+if [ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]; then
+  log "Authenticating with service-account key..."
+  gcloud auth activate-service-account \
+    --key-file "${GOOGLE_APPLICATION_CREDENTIALS}" \
+    --project "${E2E_PROJECT_ID}" \
+    --quiet
+fi
 
 # Verify the project exists and is accessible; avoids silent hangs on a wrong ID.
 if ! gcloud projects describe "${E2E_PROJECT_ID}" &>/dev/null; then
@@ -89,6 +107,38 @@ else
     --quiet
 fi
 
+# Two dedicated pod ranges for the multi-pod-range e2e tests. Added to this
+# subnet so both are valid pod range candidates for the same cluster. Largest
+# first would be the obvious ordering; the tests list the smaller one first to
+# prove free-IP ranking actually drives selection.
+SUBNET_SECONDARY_RANGES="$(gcloud compute networks subnets describe "${SUBNET_NAME}" \
+  --region "${E2E_REGION}" --project "${E2E_PROJECT_ID}" \
+  --flatten='secondaryIpRanges[]' \
+  --format='csv[no-heading](secondaryIpRanges.rangeName,secondaryIpRanges.ipCidrRange)')"
+MISSING_POD_RANGES=""
+for entry in "${SMALL_PODS_RANGE}=${SMALL_PODS_CIDR}" "${LARGE_PODS_RANGE}=${LARGE_PODS_CIDR}"; do
+  RANGE_NAME="${entry%%=*}"
+  RANGE_CIDR="${entry#*=}"
+  EXISTING_CIDR="$(printf '%s\n' "${SUBNET_SECONDARY_RANGES}" \
+    | awk -F, -v name="${RANGE_NAME}" '$1 == name { print $2 }')"
+  if [ -z "${EXISTING_CIDR}" ]; then
+    log "Adding pod range ${RANGE_NAME}=${RANGE_CIDR} to subnet ${SUBNET_NAME}..."
+    MISSING_POD_RANGES="${MISSING_POD_RANGES:+${MISSING_POD_RANGES},}${RANGE_NAME}=${RANGE_CIDR}"
+  elif [ "${EXISTING_CIDR}" != "${RANGE_CIDR}" ]; then
+    echo "ERROR: secondary range ${RANGE_NAME} exists as ${EXISTING_CIDR}, but e2e tests expect ${RANGE_CIDR}." >&2
+    echo "Remove or rename that secondary range and re-run, or update the fixture CIDRs in this script." >&2
+    exit 1
+  else
+    log "Reusing pod range ${RANGE_NAME}=${EXISTING_CIDR}"
+  fi
+done
+if [ -n "${MISSING_POD_RANGES}" ]; then
+  gcloud compute networks subnets update "${SUBNET_NAME}" \
+    --region "${E2E_REGION}" \
+    --project "${E2E_PROJECT_ID}" \
+    --add-secondary-ranges "${MISSING_POD_RANGES}" \
+    --quiet
+fi
 # Cloud Router (prerequisite for Cloud NAT)
 if gcloud compute routers describe "${ROUTER_NAME}" \
     --region "${E2E_REGION}" --project "${E2E_PROJECT_ID}" \
@@ -257,6 +307,26 @@ case "${CLUSTER_STATUS}" in
     ;;
 esac
 
+# Attach the dedicated pod ranges before deploying so the controller starts
+# with fresh cluster configuration.
+CLUSTER_POD_RANGES="$(gcloud container clusters describe "${CLUSTER_NAME}" \
+  --location "${E2E_LOCATION}" --project "${E2E_PROJECT_ID}" \
+  --format='csv[no-heading](ipAllocationPolicy.additionalPodRangesConfig.podRangeNames)')"
+MISSING_CLUSTER_RANGES=""
+for RANGE_NAME in "${SMALL_PODS_RANGE}" "${LARGE_PODS_RANGE}"; do
+  if [[ ",${CLUSTER_POD_RANGES}," != *",${RANGE_NAME},"* ]]; then
+    MISSING_CLUSTER_RANGES="${MISSING_CLUSTER_RANGES:+${MISSING_CLUSTER_RANGES},}${RANGE_NAME}"
+  fi
+done
+if [ -n "${MISSING_CLUSTER_RANGES}" ]; then
+  log "Attaching pod ranges ${MISSING_CLUSTER_RANGES} to cluster ${CLUSTER_NAME}..."
+  gcloud container clusters update "${CLUSTER_NAME}" \
+    --location "${E2E_LOCATION}" \
+    --project "${E2E_PROJECT_ID}" \
+    --additional-pod-ipv4-ranges "${MISSING_CLUSTER_RANGES}" \
+    --quiet
+fi
+
 log "Fetching cluster credentials..."
 gcloud container clusters get-credentials "${CLUSTER_NAME}" \
   --location "${E2E_LOCATION}" \
@@ -276,7 +346,7 @@ gcloud iam service-accounts add-iam-policy-binding "${GSA_EMAIL}" \
   --project "${E2E_PROJECT_ID}" \
   --quiet >/dev/null
 
-GOOGLE_APPLICATION_CREDENTIALS="${GOOGLE_APPLICATION_CREDENTIALS}" \
+GOOGLE_APPLICATION_CREDENTIALS="${GOOGLE_APPLICATION_CREDENTIALS:-}" \
 E2E_PROJECT_ID="${E2E_PROJECT_ID}" \
 E2E_PREFIX="${E2E_PREFIX}" \
 E2E_REGION="${E2E_REGION}" \
@@ -286,4 +356,4 @@ E2E_LOCATION="${E2E_LOCATION}" \
 log ""
 log "Setup complete."
 log "Run tests with:"
-log "  make e2etests"
+log "  make e2e-tests"

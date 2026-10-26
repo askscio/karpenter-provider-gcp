@@ -22,11 +22,79 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	"sigs.k8s.io/yaml"
 )
 
+func crdPath() string {
+	return filepath.Join("..", "..", "..", "charts", "karpenter", "crds", "karpenter.k8s.gcp_gcenodeclasses.yaml")
+}
+
+func nodeClassSchema(t *testing.T) apiextensionsv1.JSONSchemaProps {
+	t.Helper()
+
+	raw, err := os.ReadFile(crdPath())
+	require.NoError(t, err)
+
+	var crd apiextensionsv1.CustomResourceDefinition
+	require.NoError(t, yaml.Unmarshal(raw, &crd))
+	require.Len(t, crd.Spec.Versions, 1)
+
+	return *crd.Spec.Versions[0].Schema.OpenAPIV3Schema
+}
+
+func specSchema(t *testing.T) apiextensionsv1.JSONSchemaProps {
+	t.Helper()
+	return nodeClassSchema(t).Properties["spec"]
+}
+
+func TestGCENodeClassCRDFreeIPCount(t *testing.T) {
+	rangeSchema := nodeClassSchema(t).Properties["status"].Properties["subnetRanges"].Items.Schema
+	field, ok := rangeSchema.Properties["totalFreeIP"]
+	require.True(t, ok)
+	require.Equal(t, "integer", field.Type)
+	require.Equal(t, "int64", field.Format)
+	require.NotNil(t, field.Minimum)
+	require.Equal(t, float64(0), *field.Minimum)
+	require.NotContains(t, rangeSchema.Required, "totalFreeIP")
+	require.NotContains(t, rangeSchema.Properties, "utilization")
+}
+
+func kubeletConfigurationSchema(t *testing.T) apiextensionsv1.JSONSchemaProps {
+	t.Helper()
+	return specSchema(t).Properties["kubeletConfiguration"]
+}
+
+func hugepagesSchema(t *testing.T) apiextensionsv1.JSONSchemaProps {
+	t.Helper()
+	return specSchema(t).Properties["linuxNodeConfig"].Properties["hugepages"]
+}
+
+func TestGCENodeClassCRDAllowsMaxParallelImagePullsOfOne(t *testing.T) {
+	field := kubeletConfigurationSchema(t).Properties["maxParallelImagePulls"]
+
+	require.NotNil(t, field.Minimum, "maxParallelImagePulls must declare a minimum")
+	require.Equal(t, float64(1), *field.Minimum, "maxParallelImagePulls must accept 1, the kubelet default")
+}
+
+func TestGCENodeClassCRDRestrictsParallelImagePullsAboveOne(t *testing.T) {
+	const rule = `!has(self.maxParallelImagePulls) || self.maxParallelImagePulls < 2 || ` +
+		`(has(self.serializeImagePulls) && self.serializeImagePulls == false)`
+
+	var found bool
+	for _, v := range kubeletConfigurationSchema(t).XValidations {
+		if v.Rule == rule {
+			found = true
+			require.Equal(t,
+				"maxParallelImagePulls greater than 1 requires serializeImagePulls to be explicitly set to false",
+				v.Message)
+		}
+	}
+	require.True(t, found, "serializeImagePulls must still be required from maxParallelImagePulls 2 upwards")
+}
+
 func TestGCENodeClassCRDRejectsReservedMetadataKeys(t *testing.T) {
-	crdPath := filepath.Join("..", "..", "..", "charts", "karpenter", "crds", "karpenter.k8s.gcp_gcenodeclasses.yaml")
-	crd, err := os.ReadFile(crdPath)
+	crd, err := os.ReadFile(crdPath())
 	require.NoError(t, err)
 
 	crdText := string(crd)
@@ -62,4 +130,33 @@ func TestGCENodeClassCRDRejectsReservedMetadataKeys(t *testing.T) {
 		require.Contains(t, crdText, `'`+key+`'`, "reserved metadata key %q must be denied by the CRD", key)
 	}
 	require.NotContains(t, crdText, `'serial-port-logging-enable'`, "non-reserved metadata keys must remain freeform")
+}
+
+func TestGCENodeClassCRDSubnetRangeNamesMutuallyExclusive(t *testing.T) {
+	crd, err := os.ReadFile(crdPath())
+	require.NoError(t, err)
+
+	crdText := string(crd)
+	require.Contains(t, crdText, `subnetRangeName and subnetRangeNames are mutually exclusive`)
+	require.Contains(t, crdText, `!(has(self.subnetRangeName) && has(self.subnetRangeNames))`)
+	require.Contains(t, crdText, `subnetRangeNames:`)
+}
+
+func TestGCENodeClassCRDSubnetRangeNamesUniqueViaCEL(t *testing.T) {
+	crd, err := os.ReadFile(crdPath())
+	require.NoError(t, err)
+
+	crdText := string(crd)
+	require.NotContains(t, crdText, `uniqueItems: true`, "Kubernetes CRDs forbid uniqueItems")
+	require.Contains(t, crdText, `subnetRangeNames must be unique`)
+	require.Contains(t, crdText, `self.all(x, self.exists_one(y, x == y))`)
+}
+
+func TestGCENodeClassCRDRejectsZeroHugepages(t *testing.T) {
+	for _, name := range []string{"hugepageSize2m", "hugepageSize1g"} {
+		field := hugepagesSchema(t).Properties[name]
+
+		require.NotNil(t, field.Minimum, "%s must declare a minimum", name)
+		require.Equal(t, float64(1), *field.Minimum, "%s must reject 0", name)
+	}
 }

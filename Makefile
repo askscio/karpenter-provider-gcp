@@ -57,15 +57,19 @@ update: tidy download ## Update go files header, CRD and generated code
 verify-codegen: update ## Verify generated code is up to date
 	git diff --exit-code || (echo "Generated files are out of date — run 'make update' and commit the changes" && exit 1)
 
-chart-lint: ## Lint the Helm charts (validates values.schema.json and templates)
+chart-deps: ## Fetch Helm subchart archives pinned in charts/karpenter/Chart.lock
+	helm dependency build charts/karpenter
+
+chart-lint: chart-deps ## Lint the Helm charts (validates values.schema.json and templates)
 	helm lint charts/karpenter/
 	helm lint charts/karpenter-crd/
 
+# Remove nojsonv2 once kubectl-validate no longer uses its legacy vendored JSON implementation.
 verify-crds: ## Validate generated CRDs with Kubernetes API server validation logic
 	@tmpdir=$$(mktemp -d); \
 	trap 'rm -rf "$$tmpdir"' EXIT; \
 	helm template karpenter-crd charts/karpenter-crd --include-crds > "$$tmpdir/karpenter-crd.yaml"; \
-	(cd hack/crd-tools && go tool kubectl-validate --version 1.35 ../../charts/karpenter/crds/ "$$tmpdir")
+	(cd hack/crd-tools && GOEXPERIMENT=nojsonv2 go tool kubectl-validate --version 1.35 ../../charts/karpenter/crds/ "$$tmpdir")
 
 verify: ## Verify code. Includes linting, formatting, etc
 	@command -v golangci-lint >/dev/null 2>&1 || (echo "golangci-lint not found — install it from https://golangci-lint.run/welcome/install/" && exit 1)
@@ -88,7 +92,7 @@ image: ## Build the Karpenter controller images using ko build
 	$(eval IMG_REPOSITORY=$(shell echo $(CONTROLLER_IMG) | cut -d "@" -f 1 | cut -d ":" -f 1))
 	$(eval IMG_TAG=$(shell echo $(CONTROLLER_IMG) | cut -d "@" -f 1 | cut -d ":" -f 2 -s))
 
-apply: image ## Deploy the controller from the current state of your git repository into your ~/.kube/config cluster
+apply: image chart-deps ## Deploy the controller from the current state of your git repository into your ~/.kube/config cluster
 	helm upgrade --install karpenter charts/karpenter \
 		--create-namespace \
 		--namespace ${KARPENTER_NAMESPACE} \
@@ -107,7 +111,10 @@ ut-test: ## Run unit tests
 
 # E2E configuration — names are derived from E2E_PREFIX to stay consistent
 # between the setup script and the test binary.
-# E2E_PROJECT_ID, E2E_SA_PATH, and E2E_LOCATION must be set explicitly — no defaults.
+# E2E_PROJECT_ID and E2E_LOCATION must be set explicitly — no defaults.
+# E2E_SA_PATH is optional: if unset, the scripts fall back to an active
+# `gcloud auth login` session (and `gcloud auth application-default login`
+# for the Go test binary's GCP client calls).
 E2E_PROJECT_ID   ?=
 E2E_SA_PATH      ?=
 E2E_LOCATION     ?=
@@ -115,20 +122,29 @@ E2E_PREFIX       ?= karpenter-e2e
 E2E_REGION       ?= us-central1
 E2E_CLUSTER_NAME         ?= $(E2E_PREFIX)-cluster
 E2E_PODS_RANGE           ?= $(E2E_PREFIX)-pods
+E2E_SMALL_PODS_RANGE     ?= $(E2E_PREFIX)-pods-small
+E2E_LARGE_PODS_RANGE     ?= $(E2E_PREFIX)-pods-large
 E2E_KARPENTER_NAMESPACE  ?=
 E2E_KARPENTER_DEPLOYMENT ?=
 
+# Only set GOOGLE_APPLICATION_CREDENTIALS when E2E_SA_PATH is provided.
+E2E_GAC_ENV     = $(if $(E2E_SA_PATH),GOOGLE_APPLICATION_CREDENTIALS=$(E2E_SA_PATH))
+E2E_GAC_ENV_ABS = $(if $(E2E_SA_PATH),GOOGLE_APPLICATION_CREDENTIALS=$(abspath $(E2E_SA_PATH)))
+
 e2e-setup: require-e2e-vars ## Create (or reuse) the e2e GKE cluster and supporting GCP infra
-	GOOGLE_APPLICATION_CREDENTIALS=$(E2E_SA_PATH) \
+	$(E2E_GAC_ENV) \
 	E2E_PROJECT_ID=$(E2E_PROJECT_ID) \
 	E2E_PREFIX=$(E2E_PREFIX) \
 	E2E_REGION=$(E2E_REGION) \
 	E2E_LOCATION=$(E2E_LOCATION) \
 	./hack/e2e-setup.sh
 
+e2e-clean-env: require-e2e-vars ## Remove leftover e2e Kubernetes resources (preserves cluster and controller)
+	E2E_PROJECT_ID=$(E2E_PROJECT_ID) E2E_LOCATION=$(E2E_LOCATION) E2E_PREFIX=$(E2E_PREFIX) ./hack/e2e-clean-env.sh
+
 RELEASE_VERSION ?=
-e2e-deploy: require-e2e-vars ## Build and deploy karpenter; set RELEASE_VERSION=X.Y.Z to install the published chart instead
-	GOOGLE_APPLICATION_CREDENTIALS=$(E2E_SA_PATH) \
+e2e-deploy: require-e2e-vars ## Clean e2e resources, then deploy karpenter; set RELEASE_VERSION=X.Y.Z to install the published chart instead
+	$(E2E_GAC_ENV) \
 	E2E_PROJECT_ID=$(E2E_PROJECT_ID) \
 	E2E_PREFIX=$(E2E_PREFIX) \
 	E2E_REGION=$(E2E_REGION) \
@@ -138,43 +154,51 @@ e2e-deploy: require-e2e-vars ## Build and deploy karpenter; set RELEASE_VERSION=
 
 require-e2e-vars: ## Fail fast if required e2e variables are not set
 	@test -n "$(E2E_PROJECT_ID)"  || (echo "ERROR: E2E_PROJECT_ID is not set"  >&2 && exit 1)
-	@test -n "$(E2E_SA_PATH)"     || (echo "ERROR: E2E_SA_PATH is not set"     >&2 && exit 1)
 	@test -n "$(E2E_LOCATION)"    || (echo "ERROR: E2E_LOCATION is not set"    >&2 && exit 1)
 
 GINKGO_PROCS ?= 4
-e2e-tests: require-e2e-vars ## Run all e2e test suites in parallel (GINKGO_PROCS=N, default 4)
-	GOOGLE_APPLICATION_CREDENTIALS=$(abspath $(E2E_SA_PATH)) \
+E2E_SELECTION ?=
+# Legacy alias for E2E_SELECTION.
+E2E_PRESET ?=
+E2E_LOCK_ID ?=
+E2E_REPORT ?= e2e-report.md
+e2e-tests: require-e2e-vars ## Run selected features (E2E_SELECTION=standard|gpu|all|provisioning|drift,storage, GINKGO_PROCS=N)
+	@if [ -n "$(E2E_SELECTION)" ] && [ -n "$(E2E_PRESET)" ]; then echo "ERROR: set E2E_SELECTION or E2E_PRESET, not both" >&2; exit 1; fi
+	$(E2E_GAC_ENV_ABS) \
 	PROJECT_ID=$(E2E_PROJECT_ID) \
 	CLUSTER_NAME=$(E2E_CLUSTER_NAME) \
 	CLUSTER_LOCATION=$(E2E_LOCATION) \
 	PODS_RANGE_NAME=$(E2E_PODS_RANGE) \
+	SMALL_PODS_RANGE_NAME=$(E2E_SMALL_PODS_RANGE) LARGE_PODS_RANGE_NAME=$(E2E_LARGE_PODS_RANGE) \
 	KARPENTER_NAMESPACE=$(E2E_KARPENTER_NAMESPACE) \
 	KARPENTER_DEPLOYMENT=$(E2E_KARPENTER_DEPLOYMENT) \
-	go run github.com/onsi/ginkgo/v2/ginkgo --procs=$(GINKGO_PROCS) --timeout=2h -v ./test/suites/...
+	go run ./hack/e2e-runner --selection="$(or $(E2E_SELECTION),$(E2E_PRESET),standard)" --report=$(E2E_REPORT) --lock-id="$(E2E_LOCK_ID)" -- --procs=$(GINKGO_PROCS) --timeout=2h -v
 
 FOCUS ?=
 SUITE ?=
-e2e-test: require-e2e-vars ## Run a single e2e suite or focused spec (SUITE=<name>, FOCUS="<substring>", GINKGO_PROCS=N)
-	GOOGLE_APPLICATION_CREDENTIALS=$(abspath $(E2E_SA_PATH)) \
+e2e-test: require-e2e-vars ## Run a feature directory or focused spec (SUITE=<name>, FOCUS="<substring>", GINKGO_PROCS=N)
+	$(E2E_GAC_ENV_ABS) \
 	PROJECT_ID=$(E2E_PROJECT_ID) \
 	CLUSTER_NAME=$(E2E_CLUSTER_NAME) \
 	CLUSTER_LOCATION=$(E2E_LOCATION) \
 	PODS_RANGE_NAME=$(E2E_PODS_RANGE) \
+	SMALL_PODS_RANGE_NAME=$(E2E_SMALL_PODS_RANGE) LARGE_PODS_RANGE_NAME=$(E2E_LARGE_PODS_RANGE) \
 	KARPENTER_NAMESPACE=$(E2E_KARPENTER_NAMESPACE) \
 	KARPENTER_DEPLOYMENT=$(E2E_KARPENTER_DEPLOYMENT) \
 	go run github.com/onsi/ginkgo/v2/ginkgo --procs=$(GINKGO_PROCS) --timeout=30m -v \
 	$(if $(FOCUS),--focus="$(FOCUS)",) \
-	$(if $(SUITE),./test/suites/$(SUITE)/,./test/suites/...)
+	$(if $(SUITE),,--label-filter='!suite:gpu && !suite:local-ssd-extended') \
+	$(if $(SUITE),./test/suites/$(SUITE)/,./test/suites/)
 
 e2e-teardown: ## Delete the e2e GKE cluster and all supporting GCP infra
-	GOOGLE_APPLICATION_CREDENTIALS=$(E2E_SA_PATH) \
+	$(E2E_GAC_ENV) \
 	E2E_PREFIX=$(E2E_PREFIX) \
 	E2E_REGION=$(E2E_REGION) \
 	E2E_LOCATION=$(E2E_LOCATION) \
 	./hack/e2e-teardown.sh
 
 e2e-check-clean: ## Report any orphaned e2e GCP resources (does not delete)
-	GOOGLE_APPLICATION_CREDENTIALS=$(E2E_SA_PATH) \
+	$(E2E_GAC_ENV) \
 	E2E_PREFIX=$(E2E_PREFIX) \
 	E2E_REGION=$(E2E_REGION) \
 	E2E_LOCATION=$(E2E_LOCATION) \
@@ -208,7 +232,7 @@ codegen: ## Auto generate files based on GCP APIs
 crds: ## Apply CRDs
 	kubectl apply -f charts/karpenter/crds/
 
-.PHONY: help presubmit ci run ut-test require-project-id e2e-setup e2e-tests e2e-test e2e-teardown e2e-check-clean e2e-deploy coverage update update-pdcsi-compatibility update-pricing verify-codegen verify verify-crds verify-deadcode image apply delete toolchain tidy download docs-lint docs-fix
+.PHONY: help presubmit ci run ut-test require-project-id e2e-setup e2e-tests e2e-test e2e-teardown e2e-check-clean e2e-deploy e2e-clean-env coverage update update-pdcsi-compatibility update-pricing verify-codegen verify verify-crds verify-deadcode image apply delete toolchain tidy download docs-lint docs-fix
 
 define newline
 
