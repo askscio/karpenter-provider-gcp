@@ -2,6 +2,10 @@ module github.com/cloudpilot-ai/karpenter-provider-gcp
 
 go 1.26.4
 
+// go1.26.10+ rejects chains through eMudhra's compromised emSign G3
+// intermediates in crypto/x509 (CVE-2026-111943), independent of the CA bundle.
+toolchain go1.26.10
+
 require (
 	cloud.google.com/go/compute v1.64.0
 	github.com/awslabs/operatorpkg v0.0.0-20260501204335-c49b4ca8d58d
