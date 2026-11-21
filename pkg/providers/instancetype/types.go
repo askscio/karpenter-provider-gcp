@@ -43,43 +43,68 @@ import (
 const staticKubeProxyCPUMilliCore = 100
 
 func NewInstanceType(ctx context.Context, mt *computepb.MachineType, nodeClass *v1alpha1.GCENodeClass,
-	region string, offerings cloudprovider.Offerings) *cloudprovider.InstanceType {
+	region string, offerings cloudprovider.Offerings, ssdCount int) *cloudprovider.InstanceType {
 	if offerings == nil {
 		return nil
 	}
 
-	it := NewStaticInstanceType(ctx, mt, nodeClass)
+	it := NewStaticInstanceType(ctx, mt, nodeClass, ssdCount)
 	if it == nil {
 		return nil
 	}
-	it.Requirements = computeRequirements(mt, offerings, region)
+	it.Requirements = computeRequirements(mt, offerings, region, ssdCount, nodeClass.Spec.GPUSharingConfig)
 	it.Offerings = offerings
 	return it
 }
 
-func NewStaticInstanceType(ctx context.Context, mt *computepb.MachineType, nodeClass *v1alpha1.GCENodeClass) *cloudprovider.InstanceType {
-	// Calculate disk configuration from GCENodeClass
-	bootDiskGiB, totalSSDGiB, localSSDCount := calculateDiskConfigGiB(nodeClass, mt)
-	totalStorageGiB := totalSSDGiB
-	if totalSSDGiB == 0 {
+func NewStaticInstanceType(ctx context.Context, mt *computepb.MachineType, nodeClass *v1alpha1.GCENodeClass, ssdCount int) *cloudprovider.InstanceType {
+	bootDiskSwap, err := ResolveBootDiskSwap(nodeClass, lo.FromPtr(mt.Name), int64(mt.GetMemoryMb()))
+	if err != nil {
+		// A machine whose boot disk or swap file cannot be resolved would
+		// launch a node that does not match the node class, so it must not
+		// reach the scheduling catalog.
+		log.FromContext(ctx).V(1).Info("skipping instance type for boot-disk swap", "instanceType", lo.FromPtr(mt.Name), "error", err.Error())
+		return nil
+	}
+	bootDiskGiB := bootDiskSwap.BootDiskGiB
+	totalSSDGiB := localssd.TotalGiB(lo.FromPtr(mt.Name), ssdCount)
+
+	// RawBlock SSDs do not contribute to kubelet ephemeral storage.
+	kubeletEphemeralSSDGiB, kubeletEphemeralSSDCount := totalSSDGiB, ssdCount
+	if nodeClass.Spec.LocalSsdMode != v1alpha1.LocalSSDModeEphemeral {
+		kubeletEphemeralSSDGiB, kubeletEphemeralSSDCount = 0, 0
+	}
+
+	totalStorageGiB := kubeletEphemeralSSDGiB
+	if totalStorageGiB == 0 {
 		totalStorageGiB = bootDiskGiB
 	}
 	totalStorageBytes := totalStorageGiB * 1024 * 1024 * 1024
 
 	reservedCPU, reservedMemory, evictionMemory, ephemeralEviction, ephemeralSystem := utils.ResolveReservedResource(
 		lo.FromPtr(mt.Name),
-		int64(mt.GetGuestCpus()*1000),
+		visibleCPUs(mt, nodeClass)*1000,
 		int64(mt.GetMemoryMb()),
 		bootDiskGiB,
-		totalSSDGiB,
-		localSSDCount,
+		kubeletEphemeralSSDGiB,
+		int64(kubeletEphemeralSSDCount),
 	)
+	// A boot-disk swap file occupies the boot disk before the kubelet counts
+	// ephemeral storage, so the baseline reservation is resolved against the
+	// remaining disk; the eviction threshold stays on the whole disk. The swap
+	// file itself is added to the reservation once, below.
+	if bootDiskSwap.SwapGiB > 0 && kubeletEphemeralSSDGiB == 0 {
+		_, ephemeralSystem = utils.ResolveReservedEphemeralStorage(bootDiskGiB-bootDiskSwap.SwapGiB, 0, 0)
+	}
 
 	log.FromContext(ctx).V(1).Info("calculated ephemeral storage reservations",
 		"instanceType", lo.FromPtr(mt.Name),
+		"localSsdMode", nodeClass.Spec.LocalSsdMode,
 		"bootDiskGiB", bootDiskGiB,
 		"totalSSDGiB", totalSSDGiB,
-		"localSSDCount", localSSDCount,
+		"localSSDCount", ssdCount,
+		"kubeletEphemeralSSDGiB", kubeletEphemeralSSDGiB,
+		"kubeletEphemeralSSDCount", kubeletEphemeralSSDCount,
 		"ephemeralEviction", ephemeralEviction,
 		"ephemeralSystem", ephemeralSystem)
 
@@ -108,7 +133,7 @@ func NewStaticInstanceType(ctx context.Context, mt *computepb.MachineType, nodeC
 	storageQuantity := resource.NewQuantity(totalStorageBytes, resource.BinarySI)
 
 	overhead := cloudprovider.InstanceTypeOverhead{
-		KubeReserved:      mergeKubeReserved(computedKubeReserved, kc),
+		KubeReserved:      reserveBootDiskSwap(mergeKubeReserved(computedKubeReserved, kc), bootDiskSwap.SwapGiB, kubeletEphemeralSSDGiB),
 		SystemReserved:    kcSystemReserved(computedSystemReserved, kc),
 		EvictionThreshold: evictionThreshold(memoryQuantity, storageQuantity, computedEviction, kc),
 	}
@@ -123,18 +148,8 @@ func NewStaticInstanceType(ctx context.Context, mt *computepb.MachineType, nodeC
 	return it
 }
 
-func extractCategory(part string) string {
-	i := 0
-	for ; i < len(part); i++ {
-		if part[i] >= '0' && part[i] <= '9' {
-			break
-		}
-	}
-	return part[:i]
-}
-
 //nolint:gocyclo
-func computeRequirements(mt *computepb.MachineType, offerings cloudprovider.Offerings, region string) scheduling.Requirements {
+func computeRequirements(mt *computepb.MachineType, offerings cloudprovider.Offerings, region string, ssdCount int, gpuSharing *v1alpha1.GPUSharingConfig) scheduling.Requirements {
 	requirements := scheduling.NewRequirements(
 		// Well Known Upstream
 		scheduling.NewRequirement(corev1.LabelInstanceTypeStable, corev1.NodeSelectorOpIn, lo.FromPtr(mt.Name)),
@@ -153,9 +168,8 @@ func computeRequirements(mt *computepb.MachineType, offerings cloudprovider.Offe
 
 		// Well Known to Google Cloud
 		scheduling.NewRequirement(v1alpha1.LabelInstanceCPU, corev1.NodeSelectorOpIn, fmt.Sprintf("%d", mt.GetGuestCpus())),
-		scheduling.NewRequirement(v1alpha1.LabelInstanceCPUModel, corev1.NodeSelectorOpDoesNotExist),
 		scheduling.NewRequirement(v1alpha1.LabelInstanceMemory, corev1.NodeSelectorOpIn, fmt.Sprintf("%d", mt.GetMemoryMb())),
-		scheduling.NewRequirement(v1alpha1.LabelInstanceCategory, corev1.NodeSelectorOpDoesNotExist),
+		scheduling.NewRequirement(v1alpha1.LabelInstanceBareMetal, corev1.NodeSelectorOpIn, fmt.Sprint(utils.IsBareMetalInstanceType(mt.GetName()))),
 		scheduling.NewRequirement(v1alpha1.LabelInstanceFamily, corev1.NodeSelectorOpDoesNotExist),
 		scheduling.NewRequirement(v1alpha1.LabelInstanceShape, corev1.NodeSelectorOpDoesNotExist),
 		scheduling.NewRequirement(v1alpha1.LabelInstanceGeneration, corev1.NodeSelectorOpDoesNotExist),
@@ -165,7 +179,10 @@ func computeRequirements(mt *computepb.MachineType, offerings cloudprovider.Offe
 		scheduling.NewRequirement(v1alpha1.LabelInstanceGPUCount, corev1.NodeSelectorOpDoesNotExist),
 		scheduling.NewRequirement(v1alpha1.LabelInstanceGPUMemory, corev1.NodeSelectorOpDoesNotExist),
 		scheduling.NewRequirement(v1alpha1.LabelGKEAccelerator, corev1.NodeSelectorOpDoesNotExist),
+		scheduling.NewRequirement(v1alpha1.LabelGKEGPUSharingStrategy, corev1.NodeSelectorOpDoesNotExist),
+		scheduling.NewRequirement(v1alpha1.LabelGKEMaxSharedClientsPerGPU, corev1.NodeSelectorOpDoesNotExist),
 	)
+	requirements.Add(localSSDCountRequirement(ssdCount))
 	for _, label := range disktype.AllLabels() {
 		requirements.Add(scheduling.NewRequirement(label, corev1.NodeSelectorOpDoesNotExist))
 	}
@@ -188,17 +205,20 @@ func computeRequirements(mt *computepb.MachineType, offerings cloudprovider.Offe
 	if len(mt.GetAccelerators()) > 0 {
 		gpuName := extractGPUName(mt)
 		requirements.Get(v1alpha1.LabelInstanceGPUName).Insert(gpuName)
-		requirements.Get(v1alpha1.LabelInstanceGPUCount).Insert(fmt.Sprintf("%d", len(mt.GetAccelerators())))
+		requirements.Get(v1alpha1.LabelInstanceGPUCount).Insert(fmt.Sprintf("%d", gpuCount(mt)))
 		// LabelGKEAccelerator is required by the NVIDIA device plugin DaemonSet's nodeAffinity;
 		// without it the device plugin will not schedule onto this node.
 		requirements.Get(v1alpha1.LabelGKEAccelerator).Insert(gpuName)
+		if gpuSharing != nil {
+			requirements.Get(v1alpha1.LabelGKEGPUSharingStrategy).Insert(gpuSharing.Strategy.GKEValue())
+			requirements.Get(v1alpha1.LabelGKEMaxSharedClientsPerGPU).Insert(fmt.Sprintf("%d", gpuSharing.MaxSharedClientsPerGPU))
+		}
 	}
 
-	// The format looks like: n1-standard-1, the family is n1-standard, the category is n, the instance size is 1
-	// Also, there is something like e2-medium, the family is e2, the category is e, the instance size is medium
+	// The format looks like: n1-standard-1, the family is n1, the instance size is 1.
+	// Also, there is something like e2-medium, the family is e2, the instance size is medium.
 	instanceTypeParts := strings.Split(lo.FromPtr(mt.Name), "-")
 	if len(instanceTypeParts) >= 2 {
-		requirements.Get(v1alpha1.LabelInstanceCategory).Insert(extractCategory(instanceTypeParts[0]))
 		sizeOffset := 1
 		if len(instanceTypeParts) > 3 {
 			sizeOffset = 2
@@ -213,6 +233,22 @@ func computeRequirements(mt *computepb.MachineType, offerings cloudprovider.Offe
 	}
 
 	return requirements
+}
+
+func localSSDCountRequirement(ssdCount int) *scheduling.Requirement {
+	return scheduling.NewRequirement(
+		v1alpha1.LabelInstanceLocalSsdCount,
+		corev1.NodeSelectorOpIn,
+		fmt.Sprintf("%d", ssdCount),
+	)
+}
+
+func gpuCount(mt *computepb.MachineType) int64 {
+	var count int64
+	for _, accelerator := range mt.GetAccelerators() {
+		count += int64(accelerator.GetGuestAcceleratorCount())
+	}
+	return count
 }
 
 func extractGPUName(mt *computepb.MachineType) string {
@@ -242,51 +278,43 @@ func machineTypeArch(mt *computepb.MachineType) string {
 }
 
 func computeCapacity(ctx context.Context, mt *computepb.MachineType, nodeClass *v1alpha1.GCENodeClass, totalStorageBytes int64) corev1.ResourceList {
-	maxPods := kcMaxPods(nodeClass.GetMaxPods(), nodeClass.Spec.KubeletConfiguration, int64(mt.GetGuestCpus()))
+	maxPods := kcMaxPods(nodeClass.GetMaxPods(), nodeClass.Spec.KubeletConfiguration, visibleCPUs(mt, nodeClass))
 	resourceList := corev1.ResourceList{
-		corev1.ResourceCPU:              *cpu(mt),
+		corev1.ResourceCPU:              *resource.NewQuantity(visibleCPUs(mt, nodeClass), resource.DecimalSI),
 		corev1.ResourceMemory:           *memory(ctx, mt),
 		corev1.ResourcePods:             *resource.NewQuantity(maxPods, resource.DecimalSI),
 		corev1.ResourceEphemeralStorage: *resource.NewQuantity(totalStorageBytes, resource.BinarySI),
-		v1alpha1.ResourceNVIDIAGPU:      *resource.NewQuantity(int64(len(mt.GetAccelerators())), resource.DecimalSI),
+		v1alpha1.ResourceNVIDIAGPU:      *resource.NewQuantity(gpuCount(mt)*gpuClientsPerGPU(nodeClass), resource.DecimalSI),
 	}
 	return resourceList
 }
 
-func cpu(mt *computepb.MachineType) *resource.Quantity {
-	return resource.NewQuantity(int64(mt.GetGuestCpus()), resource.DecimalSI)
+// gpuClientsPerGPU is how many nvidia.com/gpu the device plugin advertises per physical GPU.
+func gpuClientsPerGPU(nodeClass *v1alpha1.GCENodeClass) int64 {
+	if nodeClass == nil || nodeClass.Spec.GPUSharingConfig == nil || nodeClass.Spec.GPUSharingConfig.MaxSharedClientsPerGPU < 1 {
+		return 1
+	}
+	return int64(nodeClass.Spec.GPUSharingConfig.MaxSharedClientsPerGPU)
+}
+
+// visibleCPUs is the number of vCPUs the guest OS sees, which is what the
+// kubelet reports as node capacity. Machine types run two threads per physical
+// core; with ThreadsPerCore set to 1 the guest sees half the machine type's
+// vCPUs (GCE still bills all of them). The instance-cpu label keeps the machine
+// type's count, since that is the shape being bought.
+func visibleCPUs(mt *computepb.MachineType, nodeClass *v1alpha1.GCENodeClass) int64 {
+	cpus := int64(mt.GetGuestCpus())
+	if nodeClass == nil || nodeClass.Spec.AdvancedMachineFeatures == nil {
+		return cpus
+	}
+	if tpc := nodeClass.Spec.AdvancedMachineFeatures.ThreadsPerCore; tpc != nil && *tpc == 1 && cpus >= 2 {
+		return cpus / 2
+	}
+	return cpus
 }
 
 func memory(ctx context.Context, mt *computepb.MachineType) *resource.Quantity {
 	osReservedPercent := options.FromContext(ctx).VMMemoryOverheadPercent
 	totalQuantity := int64(mt.GetMemoryMb()) * 1024 * 1024
 	return resource.NewQuantity(totalQuantity-int64(float64(totalQuantity)*osReservedPercent), resource.DecimalSI)
-}
-
-func calculateDiskConfigGiB(nodeClass *v1alpha1.GCENodeClass, mt *computepb.MachineType) (int64, int64, int64) {
-	bootDiskGiB := int64(100) // Default boot disk size
-	totalSSDGiB := int64(0)
-	localSSDCount := int64(0)
-
-	if nodeClass != nil && len(nodeClass.Spec.Disks) > 0 {
-		// Use disk configuration from GCENodeClass
-		for _, disk := range nodeClass.Spec.Disks {
-			if disk.Boot {
-				// Boot disk size from nodeClass
-				bootDiskGiB = int64(disk.SizeGiB)
-			} else if disk.Category == "local-ssd" {
-				// Local SSD from nodeClass
-				totalSSDGiB += int64(disk.SizeGiB)
-				localSSDCount++
-			}
-		}
-		return bootDiskGiB, totalSSDGiB, localSSDCount
-	}
-
-	// Fallback to machine type bundled local SSDs if no nodeClass disk config
-	if bls := mt.GetBundledLocalSsds(); bls != nil && bls.PartitionCount != nil && *bls.PartitionCount > 0 {
-		localSSDCount = int64(*bls.PartitionCount)
-		totalSSDGiB = localssd.TotalGiB(lo.FromPtr(mt.Name), int(*bls.PartitionCount))
-	}
-	return bootDiskGiB, totalSSDGiB, localSSDCount
 }

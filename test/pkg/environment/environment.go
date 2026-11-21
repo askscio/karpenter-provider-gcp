@@ -34,6 +34,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
@@ -55,13 +56,14 @@ const (
 	TestNamespace = "karpenter-e2e-test"
 
 	// Timeouts — ordered from shortest to longest.
-	NodePoolReadyTimeout   = 3 * time.Minute         // Karpenter NodePool Ready condition
-	NodeClassReadyTimeout  = 3 * time.Minute         // GCENodeClass Ready condition
-	NodeClaimLaunchTimeout = 3 * time.Minute         // NodeClaim reaches Launched=True
-	NodeCleanupTimeout     = 3 * time.Minute         // karpenter-provisioned VM terminated after NodePool deletion
-	ControllerStartTimeout = 5 * time.Minute         // karpenter controller Deployment becomes available
-	ProvisioningTimeout    = 10 * time.Minute        // VM created, booted, registered, pod Running
-	ReplacementTimeout     = 2 * ProvisioningTimeout // node replacement (drift, expiration): drain + reprovision
+	NodePoolReadyTimeout    = 3 * time.Minute         // Karpenter NodePool Ready condition
+	NodeClassReadyTimeout   = 3 * time.Minute         // GCENodeClass Ready condition
+	NodeOverlayReadyTimeout = 3 * time.Minute         // NodeOverlay Ready condition
+	NodeClaimLaunchTimeout  = 3 * time.Minute         // NodeClaim reaches Launched=True
+	NodeCleanupTimeout      = 3 * time.Minute         // karpenter-provisioned VM terminated after NodePool deletion
+	ControllerStartTimeout  = 5 * time.Minute         // karpenter controller Deployment becomes available
+	ProvisioningTimeout     = 10 * time.Minute        // VM created, booted, registered, pod Running
+	ReplacementTimeout      = 2 * ProvisioningTimeout // node replacement (drift, expiration): drain + reprovision
 	// GPUProvisioningTimeout is longer than ProvisioningTimeout to account for
 	// GPU driver installation and NVIDIA device plugin startup before the
 	// nvidia.com/gpu resource becomes allocatable.
@@ -78,17 +80,23 @@ const (
 
 var (
 	// Access NodeClaims through ListNodeClaims rather than this GVR directly.
-	nodeClaimGVR    = schema.GroupVersionResource{Group: "karpenter.sh", Version: "v1", Resource: "nodeclaims"}
-	nodePoolGVR     = schema.GroupVersionResource{Group: "karpenter.sh", Version: "v1", Resource: "nodepools"}
-	gceNodeClassGVR = schema.GroupVersionResource{Group: "karpenter.k8s.gcp", Version: "v1alpha1", Resource: "gcenodeclasses"}
+	nodeClaimGVR            = schema.GroupVersionResource{Group: "karpenter.sh", Version: "v1", Resource: "nodeclaims"}
+	nodePoolGVR             = schema.GroupVersionResource{Group: "karpenter.sh", Version: "v1", Resource: "nodepools"}
+	gceNodeClassGVR         = schema.GroupVersionResource{Group: "karpenter.k8s.gcp", Version: "v1alpha1", Resource: "gcenodeclasses"}
+	gceCustomMachineTypeGVR = schema.GroupVersionResource{Group: "karpenter.k8s.gcp", Version: "v1alpha1", Resource: "gcecustommachinetypes"}
+	nodeOverlayGVR          = schema.GroupVersionResource{Group: "karpenter.sh", Version: "v1alpha1", Resource: "nodeoverlays"}
 )
 
 // Environment holds shared state for a test suite run.
 type Environment struct {
-	ProjectID       string
-	ClusterName     string
-	ClusterLocation string // region or zone, e.g. "us-central1" or "us-central1-a"
-	PodsRangeName   string
+	ProjectID          string
+	ClusterName        string
+	ClusterLocation    string // region or zone, e.g. "us-central1" or "us-central1-a"
+	PodsRangeName      string
+	SmallPodsRangeName string
+	LargePodsRangeName string
+	// ResourceManagerTagKey is the short name of the project-scoped tag key created by e2e-setup.
+	ResourceManagerTagKey string
 
 	KubeClient    kubernetes.Interface
 	DynamicClient dynamic.Interface
@@ -101,18 +109,19 @@ type Environment struct {
 	resourceSample        controllerResourceSample
 	resourceReportOnce    sync.Once
 
-	// mu guards ownedNodePools and ownedNodeClasses so Cleanup is safe when
-	// multiple Ginkgo processes share the same Environment.
-	mu               sync.Mutex
-	ownedNodePools   map[string]struct{}
-	ownedNodeClasses map[string]struct{}
+	// mu guards ownedNodePools, ownedNodeClasses, and ownedNodeOverlays so
+	// Cleanup is safe when multiple Ginkgo processes share the same Environment.
+	mu                sync.Mutex
+	ownedNodePools    map[string]struct{}
+	ownedNodeClasses  map[string]struct{}
+	ownedNodeOverlays map[string]struct{}
 }
 
 // NewEnvironment reads config from env vars, creates k8s clients, and waits
-// for the karpenter Deployment (installed by e2e-setup.sh via Helm) to be ready.
+// for the karpenter Deployment (installed by e2e-deploy.sh via Helm) to be ready.
 //
 // Required env vars: PROJECT_ID, CLUSTER_NAME, CLUSTER_LOCATION, PODS_RANGE_NAME
-// The kubeconfig must already point at the e2e cluster (set by e2e-setup.sh).
+// The kubeconfig must already point at the intended e2e cluster.
 func NewEnvironment() *Environment {
 	cfg, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
 		clientcmd.NewDefaultClientConfigLoadingRules(),
@@ -138,17 +147,21 @@ func NewEnvironment() *Environment {
 	Expect(err).NotTo(HaveOccurred(), "creating GCP compute service client")
 
 	env := &Environment{
-		ProjectID:        mustEnv("PROJECT_ID"),
-		ClusterName:      mustEnv("CLUSTER_NAME"),
-		ClusterLocation:  mustEnv("CLUSTER_LOCATION"),
-		PodsRangeName:    mustEnv("PODS_RANGE_NAME"),
-		KubeClient:       kubeClient,
-		DynamicClient:    dynamicClient,
-		MetricsClient:    metricsClient,
-		containerSvc:     containerSvc,
-		computeSvc:       computeSvc,
-		ownedNodePools:   make(map[string]struct{}),
-		ownedNodeClasses: make(map[string]struct{}),
+		ProjectID:             mustEnv("PROJECT_ID"),
+		ClusterName:           mustEnv("CLUSTER_NAME"),
+		ClusterLocation:       mustEnv("CLUSTER_LOCATION"),
+		PodsRangeName:         mustEnv("PODS_RANGE_NAME"),
+		SmallPodsRangeName:    os.Getenv("SMALL_PODS_RANGE_NAME"),
+		LargePodsRangeName:    os.Getenv("LARGE_PODS_RANGE_NAME"),
+		ResourceManagerTagKey: os.Getenv("RESOURCE_MANAGER_TAG_KEY"),
+		KubeClient:            kubeClient,
+		DynamicClient:         dynamicClient,
+		MetricsClient:         metricsClient,
+		containerSvc:          containerSvc,
+		computeSvc:            computeSvc,
+		ownedNodePools:        make(map[string]struct{}),
+		ownedNodeClasses:      make(map[string]struct{}),
+		ownedNodeOverlays:     make(map[string]struct{}),
 	}
 
 	// Fast-fail: verify the cluster exists at the configured location before
@@ -192,6 +205,13 @@ func (e *Environment) trackNodeClass(name string) {
 	e.ownedNodeClasses[name] = struct{}{}
 }
 
+// Must be called after successfully creating a NodeOverlay so that Cleanup deletes it.
+func (e *Environment) trackNodeOverlay(name string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.ownedNodeOverlays[name] = struct{}{}
+}
+
 // Cleanup removes karpenter resources created by this Environment and waits
 // for their NodeClaims to drain. Scoped to owned resources so that parallel
 // suite processes do not interfere with each other.
@@ -210,20 +230,15 @@ func (e *Environment) Cleanup() {
 	for name := range e.ownedNodeClasses {
 		classes = append(classes, name)
 	}
+	overlays := make([]string, 0, len(e.ownedNodeOverlays))
+	for name := range e.ownedNodeOverlays {
+		overlays = append(overlays, name)
+	}
 	e.mu.Unlock()
 
-	for _, name := range pools {
-		err := e.DynamicClient.Resource(nodePoolGVR).Delete(deleteCtx, name, metav1.DeleteOptions{})
-		if !apierrors.IsNotFound(err) {
-			Expect(err).NotTo(HaveOccurred(), "cleanup: deleting NodePool %s", name)
-		}
-	}
-	for _, name := range classes {
-		err := e.DynamicClient.Resource(gceNodeClassGVR).Delete(deleteCtx, name, metav1.DeleteOptions{})
-		if !apierrors.IsNotFound(err) {
-			Expect(err).NotTo(HaveOccurred(), "cleanup: deleting GCENodeClass %s", name)
-		}
-	}
+	e.cleanupOwned(deleteCtx, nodePoolGVR, "NodePool", pools)
+	e.cleanupOwned(deleteCtx, gceNodeClassGVR, "GCENodeClass", classes)
+	e.cleanupOwned(deleteCtx, nodeOverlayGVR, "NodeOverlay", overlays)
 
 	if len(pools) == 0 {
 		return
@@ -247,6 +262,15 @@ func (e *Environment) Cleanup() {
 			}
 		}
 	}).WithTimeout(NodeCleanupTimeout).WithPolling(DefaultPollInterval).Should(Succeed())
+}
+
+func (e *Environment) cleanupOwned(ctx context.Context, gvr schema.GroupVersionResource, kind string, names []string) {
+	for _, name := range names {
+		err := e.DynamicClient.Resource(gvr).Delete(ctx, name, metav1.DeleteOptions{})
+		if !apierrors.IsNotFound(err) {
+			Expect(err).NotTo(HaveOccurred(), "cleanup: deleting %s %s", kind, name)
+		}
+	}
 }
 
 // WaitForNodeRemoval polls until the named node no longer exists. Transient
@@ -276,9 +300,21 @@ func (e *Environment) ListNodeClaims(ctx context.Context) ([]unstructured.Unstru
 	return list.Items, nil
 }
 
+// ListWatchNodeClaims opens a pool-scoped watch without a gap after the initial snapshot.
+func (e *Environment) ListWatchNodeClaims(ctx context.Context, nodePool string) (*unstructured.UnstructuredList, watch.Interface, error) {
+	options := metav1.ListOptions{LabelSelector: karpv1.NodePoolLabelKey + "=" + nodePool}
+	list, err := e.DynamicClient.Resource(nodeClaimGVR).List(ctx, options)
+	if err != nil {
+		return nil, nil, err
+	}
+	options.ResourceVersion = list.GetResourceVersion()
+	stream, err := e.DynamicClient.Resource(nodeClaimGVR).Watch(ctx, options)
+	return list, stream, err
+}
+
 // waitForControllerReady polls until the karpenter Deployment has all replicas
 // available and both GKE template node pools are RUNNING.
-// The Deployment was installed by e2e-setup.sh via Helm.
+// The Deployment was installed by e2e-deploy.sh via Helm.
 func (e *Environment) waitForControllerReady() {
 	deployCtx, deployCancel := context.WithTimeout(context.Background(), ControllerStartTimeout)
 	defer deployCancel()
@@ -287,7 +323,7 @@ func (e *Environment) waitForControllerReady() {
 		dep, err := e.KubeClient.AppsV1().Deployments(KarpenterNamespace).
 			Get(deployCtx, KarpenterDeployment, metav1.GetOptions{})
 		g.Expect(err).NotTo(HaveOccurred(),
-			"getting karpenter Deployment — did e2e-setup.sh run successfully?")
+			"getting karpenter Deployment — did e2e-deploy.sh run successfully?")
 		g.Expect(dep.Status.AvailableReplicas).To(BeNumerically(">=", 1),
 			"karpenter Deployment has no available replicas yet")
 	}).WithTimeout(ControllerStartTimeout).WithPolling(DefaultPollInterval).Should(Succeed())

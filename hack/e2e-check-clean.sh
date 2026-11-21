@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# e2e-check-clean.sh — Reports any GCP resources created by e2e-setup.sh that
+# e2e-check-clean.sh — Reports e2e GCP resources that
 # still exist. Exits 0 if clean, 1 if orphaned resources are found.
 # Does NOT delete anything.
 #
-# Optional (with defaults matching e2e-setup.sh):
+# Optional (with local e2e defaults):
 #   GOOGLE_APPLICATION_CREDENTIALS  path to service-account key JSON
 #   E2E_PROJECT_ID  GCP project ID  (default: parsed from credentials)
 #   E2E_PREFIX      resource name prefix  (default: karpenter-e2e)
@@ -17,14 +17,16 @@ if [ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]; then
     --quiet 2>/dev/null
 fi
 
-# E2E_PROJECT_ID can be set explicitly; if not, extract it from the credentials file.
+# E2E_PROJECT_ID can be set explicitly; if not, extract it from the credentials
+# file, falling back to the active gcloud config.
 if [ -z "${E2E_PROJECT_ID:-}" ]; then
-  if [ -z "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]; then
-    echo "ERROR: E2E_PROJECT_ID is not set and GOOGLE_APPLICATION_CREDENTIALS is not set — cannot determine project." >&2
-    exit 1
+  if [ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]; then
+    E2E_PROJECT_ID="$(python3 -c "import json; print(json.load(open('${GOOGLE_APPLICATION_CREDENTIALS}'))['project_id'])")" \
+      || { echo "ERROR: could not parse project_id from ${GOOGLE_APPLICATION_CREDENTIALS}" >&2; exit 1; }
+  else
+    E2E_PROJECT_ID="$(gcloud config get-value project 2>/dev/null)"
+    : "${E2E_PROJECT_ID:?E2E_PROJECT_ID is not set and could not be derived from the active gcloud config}"
   fi
-  E2E_PROJECT_ID="$(python3 -c "import json; print(json.load(open('${GOOGLE_APPLICATION_CREDENTIALS}'))['project_id'])")" \
-    || { echo "ERROR: could not parse project_id from ${GOOGLE_APPLICATION_CREDENTIALS}" >&2; exit 1; }
 fi
 
 : "${E2E_LOCATION:?E2E_LOCATION must be set (zone, e.g. us-central1-f, or region, e.g. us-central1)}"
@@ -93,6 +95,11 @@ if gcloud iam service-accounts describe "${GSA_EMAIL}" \
   report "Service account" "${GSA_EMAIL}"
 fi
 
+# Resource manager tag key
+if gcloud resource-manager tags keys describe "${E2E_PROJECT_ID}/${E2E_PREFIX}-tag" &>/dev/null; then
+  report "Resource manager tag key" "${E2E_PROJECT_ID}/${E2E_PREFIX}-tag"
+fi
+
 # Cloud NAT
 if gcloud compute routers nats describe "${NAT_NAME}" \
     --router "${ROUTER_NAME}" \
@@ -128,6 +135,6 @@ if [ "${found}" -eq 0 ]; then
   exit 0
 else
   echo "" >&2
-  echo "Run hack/e2e-teardown.sh to remove the above resources." >&2
+  echo "Retirement requires the approved Terraform maintenance procedure in deploy/terraform-e2e/README.md." >&2
   exit 1
 fi

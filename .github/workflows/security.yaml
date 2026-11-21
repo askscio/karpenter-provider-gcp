@@ -1,0 +1,126 @@
+name: Security checks
+
+on:
+  push:
+    branches: [ "main" ]
+  schedule:
+    - cron: '45 6 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  govulncheck:
+    if: github.repository == 'cloudpilot-ai/karpenter-provider-gcp' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    env:
+      GOOS: linux
+      GOARCH: amd64
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Report Go vulnerabilities
+        id: report
+        run: make vulncheck VULNCHECK_FLAGS='-format sarif' > govulncheck.sarif
+      # SARIF output exits zero even on findings; text mode supplies the real gate.
+      - name: Fail on reachable Go vulnerabilities
+        if: steps.report.outcome == 'success'
+        run: make vulncheck
+      - name: Upload Go findings to code scanning
+        if: ${{ !cancelled() && steps.report.outcome == 'success' }}
+        uses: github/codeql-action/upload-sarif@v4.39.3
+        with:
+          sarif_file: govulncheck.sarif
+          category: govulncheck/controller-linux-amd64
+      - name: Retain Go findings
+        if: ${{ !cancelled() && steps.report.outcome == 'success' }}
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: govulncheck-sarif
+          path: govulncheck.sarif
+          if-no-files-found: error
+
+  container-image:
+    if: github.repository == 'cloudpilot-ai/karpenter-provider-gcp' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    env:
+      PLATFORM: linux/${{ matrix.arch }}
+      GOTOOLCHAIN: local
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@v7.0.0
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            hack/tools/go.sum
+      - name: Install image builder
+        run: cd hack/tools && go install github.com/google/ko
+      - name: Build local controller image
+        env:
+          # ko requires a repository even with --push=false.
+          KO_DOCKER_REPO: example.invalid/karpenter
+        run: |
+          mkdir reports
+          printf 'commit: %s\nplatform: %s\ncompiler: %s\n' \
+            "$GITHUB_SHA" "$PLATFORM" "$(go env GOVERSION)" > reports/build.txt
+          grep '^defaultBaseImage:' .ko.yaml >> reports/build.txt
+          ko build --bare --push=false --platform "$PLATFORM" --tarball "$RUNNER_TEMP/controller.tar" \
+            ./cmd/controller > reports/image.txt
+      - name: Install image scanner
+        id: grype
+        uses: anchore/scan-action/download-grype@v7.4.2
+        with:
+          grype-version: v0.118.0
+          cache-db: true
+      - name: Scan OS and Go dependencies
+        id: scan
+        # A stable input path keeps SARIF locations consistent across runs.
+        working-directory: ${{ runner.temp }}
+        run: |
+          "${{ steps.grype.outputs.cmd }}" docker-archive:controller.tar \
+            --output "json=$GITHUB_WORKSPACE/reports/grype.json" \
+            --output "sarif=$GITHUB_WORKSPACE/reports/grype.sarif"
+      # govulncheck gates reachable Go vulnerabilities; retain all image findings above.
+      - name: Fail on fixable high or critical OS vulnerabilities
+        if: steps.scan.outcome == 'success'
+        run: |
+          jq '[.matches[] |
+            select(.artifact.type | IN("deb", "rpm", "apk", "alpm", "portage")) |
+            select(.vulnerability.severity == "High" or .vulnerability.severity == "Critical") |
+            select(.vulnerability.fix.state == "fixed") |
+            select(any(.vulnerability.fix.versions[]?; type == "string" and length > 0))]' \
+            reports/grype.json > reports/blocking-vulnerabilities.json
+          jq -e 'length == 0' reports/blocking-vulnerabilities.json
+      - name: Upload image findings to code scanning
+        if: ${{ !cancelled() && steps.scan.outcome == 'success' }}
+        uses: github/codeql-action/upload-sarif@v4.39.3
+        with:
+          sarif_file: reports/grype.sarif
+          category: grype/main-controller-linux-${{ matrix.arch }}
+      - name: Retain image inventory and findings
+        if: ${{ !cancelled() && steps.scan.outcome == 'success' }}
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: main-image-security-linux-${{ matrix.arch }}
+          path: reports/
+          if-no-files-found: error

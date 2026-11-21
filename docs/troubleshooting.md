@@ -40,6 +40,44 @@ kubectl describe node <karpenter-node-name>
 
 If the node never becomes `Ready`, check kubelet logs on the instance (via serial port or SSH if the node has a public IP or IAP access is configured).
 
+### Registered Node has no PodCIDR
+
+If a registered Node is `NotReady` with `NetworkPluginNotReady`, check whether `spec.podCIDR` is populated. Repeated `CIDRNotAvailable` Events from `cidrAllocator` point to Pod CIDR assignment rather than a VM creation failure:
+
+```sh
+kubectl describe node <node>
+kubectl get node <node> -o jsonpath='{.spec.podCIDRs}{"\n"}'
+kubectl get node <node> --show-labels
+gcloud compute instances describe <vm> --project=<project> --zone=<zone> \
+  --format='yaml(networkInterfaces.subnetwork,networkInterfaces.aliasIpRanges,networkInterfaces.stackType)'
+```
+
+Compare the VM's primary alias CIDR with the Node's PodCIDRs. On a dual-stack cluster, the Node needs both an IPv4 and an IPv6 PodCIDR, and the VM's primary interface must have stack type `IPV4_IPV6`. See [Dual-stack clusters](networking/private-nodes.md#dual-stack-clusters). If the alias exists but the Node has no PodCIDR, preserve these outputs and Node Events when investigating bootstrap or IPAM failures. Do not manually assign Node PodCIDRs.
+
+For multi-networking clusters, also inspect the default Network and its GKENetworkParamSet:
+
+```sh
+kubectl get networks.networking.gke.io default -o yaml
+kubectl get gkenetworkparamsets.networking.gke.io <parametersRef-name> -o yaml
+```
+
+Use the default Network's `spec.parametersRef.name` for the last command. In this mode, the `cloud.google.com/gke-np-default-subnet` and `cloud.google.com/gke-np-default-pod-range` labels should identify the primary interface's actual subnet and range as bare names, not URLs or CIDRs. Ordinary single-network nodes do not need these labels.
+
+GKENetworkParamSet membership is dynamic; a missing range entry alone does not prove that the range is unusable. Do not patch GKE-managed networking objects.
+
+Controller bootstrap changes apply to newly created VMs, not existing nodes. Establish the cause before replacing affected nodes through your normal lifecycle procedure.
+
+---
+
+## Controller exits at startup
+
+If the Karpenter pod restarts repeatedly and its previous logs contain `failed to get Compute Engine default service account`, the controller couldn't read the project's Compute Engine default service account. The controller makes this lookup at startup when `DEFAULT_NODEPOOL_SERVICE_ACCOUNT` is unset.
+
+To fix it, do one of the following:
+
+- Make sure the controller can reach the Compute Engine API and its service account has `compute.projects.get`. The [controller role](../deploy/iam/karpenter-controller-role.yaml) includes this permission.
+- Set `DEFAULT_NODEPOOL_SERVICE_ACCOUNT` (Helm: `controller.settings.defaultNodepoolServiceAccount`) to skip the lookup. See [Service account resolution](settings.md#service-account-resolution).
+
 ---
 
 ## GCENodeClass not becoming Ready
@@ -50,13 +88,16 @@ kubectl describe gcenodeclass <name>
 
 Check `status.conditions`. The `ImagesReady` condition shows whether Karpenter can resolve the configured image.
 
-**Common causes:**
+Use the condition message and [available-image commands](image-management.md#finding-available-versions) to distinguish configuration errors from publication delays:
 
-- **Invalid version format** — Pinned versions must match the family's format: `milestone.build.build.build` for ContainerOptimizedOS (e.g. `125.19216.104.126`), `vYYYYMMDD` for Ubuntu (e.g. `v20260416`). Invalid formats are rejected at admission.
+| Reason                  | Meaning                                                                                  | Action / retry                                                                                                         |
+|-------------------------|------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------|
+| `ImageResolutionFailed` | Invalid selector, or no usable catalog image for a required Ubuntu architecture.         | Check the selector and published versions. Retries every minute; Ubuntu publication can recover without a spec change. |
+| `ImageUnavailable`      | No usable COS candidate or a selected image is not `READY`; previous images are cleared. | Wait for publication; retries every minute.                                                                            |
+| `ImageLookupFailed`     | API lookup failed; previous images remain diagnostic only.                               | Check permissions/API availability; retries with controller error backoff.                                             |
+| `ImagesNotFound`        | No images matched, for example a missing raw ID; previous images are cleared.            | Verify the image ID; retries every minute.                                                                             |
 
-- **Version not found** — If `ImagesReady` shows `ImageResolutionFailed`, the pinned version does not exist in GCP. Verify availability using the `gcloud compute images list` commands in [Image management](image-management.md#finding-available-versions).
-
-- **Unsupported family** — Only `ContainerOptimizedOS` and `Ubuntu` are supported.
+While `ImagesReady` is not `True`, no new nodes can use retained status. For COS, `True` may represent a partial set; see [missing arm64/GPU variants](#arm64-or-gpu-nodes-not-launching-with-containeroptimizedos).
 
 Example using the recommended structured fields:
 
@@ -74,9 +115,32 @@ See [Image management](image-management.md) for version pinning options and form
 
 ## Custom machine types not discovered
 
-Karpenter discovers instance types by querying the GCP `machineTypes.aggregatedList` API, which returns only predefined catalog types. Custom machine types (e.g. `n2-custom-8-24576`) are not returned by this API and are therefore not available for scheduling via standard `karpenter.sh/instance-type` label requirements.
+Karpenter discovers most instance types by querying the GCP `machineTypes.aggregatedList` API, which returns only predefined catalog types. Custom machine types (e.g. `n2-custom-8-24576`) are never returned by this API, even when instances using that exact shape already exist in the project.
 
-This is a known limitation tracked in [GitHub issue #245](https://github.com/cloudpilot-ai/karpenter-provider-gcp/issues/245).
+To make a custom machine type schedulable, register it with a `GCECustomMachineType` object. GCP does not publish a price for custom shapes, so an on-demand and Spot price must be supplied explicitly:
+
+```yaml
+apiVersion: karpenter.k8s.gcp/v1alpha1
+kind: GCECustomMachineType
+metadata:
+  name: n2-custom-8-24576
+spec:
+  machineType: n2-custom-8-24576
+  prices:
+    onDemand: "0.40"
+    spot: "0.12"
+```
+
+A dedicated controller resolves the shape's vCPU/memory and per-zone availability via the GCP `machineTypes.get` API (which, unlike the aggregated list, does support custom shapes) and reports it on `status`:
+
+```sh
+kubectl get gcecustommachinetype n2-custom-8-24576
+kubectl describe gcecustommachinetype n2-custom-8-24576
+```
+
+Check the `Ready` condition if it doesn't show up as schedulable — `Ready=False` with reason `MachineTypeNotFound` means the named shape is invalid for its family, or the family doesn't support custom shapes in any zone available to the cluster.
+
+Once `Ready=True`, the registered shape joins the regular instance type catalog: it's schedulable via an exact `node.kubernetes.io/instance-type` requirement, or via ordinary CPU/memory requirements, exactly like a predefined type.
 
 ---
 
@@ -117,8 +181,7 @@ shieldedInstanceConfig:
 
 ```yaml
 disks:
-  - category: pd-balanced
-    sizeGiB: 60
+  - sizeGiB: 60
     boot: true
     kmsKeyName: projects/my-project/locations/us-central1/keyRings/my-ring/cryptoKeys/my-key
 ```
@@ -144,6 +207,16 @@ The default `ContainerOptimizedOS` and `Ubuntu` images work for CPU Confidential
 
 ---
 
+## arm64 or GPU nodes not launching with ContainerOptimizedOS
+
+A ready COS NodeClass can lack an arm64 or NVIDIA variant. Inspect its resolved images:
+
+```sh
+kubectl get gcenodeclass <name> -o jsonpath='{range .status.images[*]}{.sourceImage}{"\n"}{end}'
+```
+
+If `-cos-arm64-` or `-c-nvda` is absent, matching instance types are not launchable yet. Check [available images](image-management.md#finding-available-versions); successful resolution refreshes every five minutes. See [COS variant selection](image-selection.md#container-optimized-os-variants) for fallback and drift behavior.
+
 ## arm64 provisioning not available
 
 arm64 node provisioning may be unavailable if the cluster's region does not support arm64 machine types. Check Karpenter startup logs for related messages.
@@ -151,6 +224,13 @@ arm64 node provisioning may be unavailable if the cluster's region does not supp
 Karpenter detects arm64 architecture directly from the GCP Compute API. All arm64-capable instance families (`c4a`, `t2a`, `n4a`) are supported automatically.
 
 Image resolution queries GCP image catalogs directly and does not depend on the bootstrap pool. Bootstrap pool discovery and kube-env patching allow a single source pool (of any architecture) to bootstrap nodes of any OS and architecture combination. See [Bootstrap pool selection](bootstrap-pool.md) for details.
+
+For the `Ubuntu` families, each architecture is resolved independently from the image catalog: Karpenter selects the newest clean `amd64` image and the newest clean `arm64` image separately, and excludes specialized variant builds (e.g. `-tpu`, `-cgroupsv1`, `-linux64k`, `-test`). If no `arm64` image exists for the cluster's Kubernetes minor version, the `GCENodeClass` reports `ImagesReady=False` with reason `ImageResolutionFailed` rather than resolving an `amd64`-only image set — so an arm64 pool never appears ready while it cannot actually provision. If you see this, confirm an `arm64` image is published for your Kubernetes version:
+
+```sh
+gcloud compute images list --project=ubuntu-os-gke-cloud \
+  --filter="name~'^ubuntu-gke-2404-<major>-<minor>-arm64-v'" --sort-by=~creationTimestamp
+```
 
 To verify arm64 machine types are available in your cluster's region:
 
@@ -169,6 +249,18 @@ If an idle node is not being removed, check the following:
 - **`consolidateAfter` and disruption budgets.** Karpenter waits for `consolidateAfter` to elapse before disrupting a node, and disruption budgets can block or rate-limit removals. A budget that sets `nodes: "0"` for the `Empty` reason prevents empty-node removal entirely. Review the NodePool's `spec.disruption` to confirm the timing and budgets are what you expect.
 
 - **`consolidationPolicy`.** `WhenEmpty` removes only nodes that have no reschedulable pods. A node that still runs a Deployment-owned system pod — such as the GKE `konnectivity-agent` — is not considered empty by Karpenter core, because the pod is not DaemonSet overhead. Such a node remains until it can be consolidated as underutilized. Use `WhenEmptyOrUnderutilized` if you want Karpenter to consider removing or replacing these lightly loaded nodes.
+
+  ```yaml
+  disruption:
+    consolidationPolicy: WhenEmptyOrUnderutilized
+    consolidateAfter: 30s
+  ```
+
+Check the current disruption settings on your NodePools with:
+
+```sh
+kubectl get nodepools -o yaml
+```
 
 See the [NodePool disruption reference](reference/nodepool.md#disruption) for the full list of settings.
 
@@ -190,7 +282,21 @@ GC only deletes instances that carry the Karpenter cluster tag and have no corre
 
 ## Insufficient capacity errors
 
-When Karpenter cannot provision an instance due to insufficient capacity (Spot or on-demand), it logs the error and marks the zone/instance-type/capacity-type combination as unavailable for 30 minutes. Karpenter skips these cached entries during zone selection, allowing the TTL to expire naturally so zones can recover and become available again.
+When Karpenter cannot provision an instance due to insufficient capacity (Spot or on-demand), it logs the error and marks the zone/instance-type/capacity-type combination as unavailable. The duration depends on the error, and you can configure each one:
+
+- Stockout (`ZONE_RESOURCE_POOL_EXHAUSTED`): `STOCKOUT_TTL`, default 5 minutes.
+- Unsupported configuration (`configuration_availability` or `MACHINE_TYPE_UNSUPPORTED`): `UNSUPPORTED_CONFIGURATION_TTL`, default 1 hour.
+- IP space exhaustion (`IP_SPACE_EXHAUSTED`): `IP_SPACE_EXHAUSTED_TTL`, default 30 seconds.
+
+Karpenter skips these cached entries during zone selection, allowing the TTL to expire naturally so zones can recover and become available again.
+
+A NodePool limited to one machine type in one zone has no other offering to fall back to. During a stockout, its pods stay Pending until the entry expires. Lower `STOCKOUT_TTL` to retry the zone sooner. See [Launch failure backoff](settings.md#launch-failure-backoff).
+
+GCE enforces project quotas per region. When a launch fails with `QUOTA_EXCEEDED`, Karpenter marks the instance type unavailable for that capacity type in every zone of the region. The entry lasts for `QUOTA_EXCEEDED_TTL`, which defaults to 30 minutes. After you raise the quota in the Google Cloud console, wait for the TTL to expire or restart the controller to clear the entry. See [Quota exhaustion](settings.md#quota-exhaustion).
+
+Karpenter can fall back from Spot to on-demand within a single launch. This happens when the NodeClaim allows both capacity types and every Spot attempt fails for lack of capacity or quota. Quota failures count toward fallback only when quota backoff is enabled; with `QUOTA_EXCEEDED_TTL=0s`, a quota failure prevents fallback. The on-demand retry starts from the lowest-priced on-demand instance type. If any Spot attempt fails for another reason, such as a GCE API error, Karpenter does not fall back and the launch fails.
+
+If a NodeClass has more than one candidate pod range, Karpenter tries the next range when one reports IP space exhaustion. It marks the offering unavailable only after every candidate range is exhausted.
 
 If all zones for a given instance type are exhausted, Karpenter returns an insufficient capacity error immediately without attempting GCP API calls that would fail.
 
@@ -212,7 +318,21 @@ To increase provisioning success:
     values: ["us-central1-a", "us-central1-b", "us-central1-c", "us-central1-f"]
   ```
 
-- Allow both spot and on-demand to let Karpenter fall back automatically.
+- Allow both `spot` and `on-demand` in the NodePool's `karpenter.sh/capacity-type` requirement so Karpenter can fall back to on-demand when Spot capacity runs out.
+
+---
+
+## NodeClaim launch fails with `ResourceNotReady`
+
+If the `NodeClaim` `Launched` condition reports the reason `ResourceNotReady`, GCE rejected the instance. A resource that the instance references is not ready yet. This resource is usually the boot image, for example when the image status changed after Karpenter selected it.
+
+The problem affects every instance type, so Karpenter does not try the next instance type. It also does not mark the instance type or zone as unavailable. Karpenter retries the launch later and starts again from the lowest-priced instance type. The launch succeeds after the resource becomes ready.
+
+If the condition persists, confirm that the boot image status is `READY`:
+
+```sh
+gcloud compute images describe <image-name> --project <image-project> --format="value(status)"
+```
 
 ---
 

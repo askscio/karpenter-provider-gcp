@@ -8,19 +8,32 @@
 #                            No local build. Used to validate published releases.
 #
 # Required env vars:
-#   GOOGLE_APPLICATION_CREDENTIALS  path to service-account key JSON
 #   E2E_PROJECT_ID                  GCP project ID
 #   E2E_LOCATION                    GCP location (zone or region)
 #
 # Optional env vars:
+#   GOOGLE_APPLICATION_CREDENTIALS  path to service-account key JSON
+#                                   (not needed if `gcloud auth login` is already active)
 #   RELEASE_VERSION   published chart version to install (e.g. 0.3.2)
 #   E2E_PREFIX        resource name prefix (default: karpenter-e2e)
 #   E2E_REGION        GCP region (default: us-central1)
+#   E2E_NODE_SERVICE_ACCOUNT  node SA email (unset keeps the chart default)
 set -euo pipefail
 
-: "${GOOGLE_APPLICATION_CREDENTIALS:?GOOGLE_APPLICATION_CREDENTIALS must be set}"
+REPO_ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
+# A clean checkout has no vendored Helm subcharts. Check the pinned dependency
+# before cleanup, image publishing, or any GCP access (release charts do not use it).
+if [[ -z "${RELEASE_VERSION:-}" ]]; then
+  helm dependency build "${REPO_ROOT}/charts/karpenter"
+fi
+
 : "${E2E_PROJECT_ID:?E2E_PROJECT_ID must be set}"
 : "${E2E_LOCATION:?E2E_LOCATION must be set}"
+
+if [ -z "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]; then
+  ACTIVE_ACCOUNT="$(gcloud auth list --filter=status:ACTIVE --format='value(account)' 2>/dev/null)"
+  : "${ACTIVE_ACCOUNT:?No active gcloud login found and GOOGLE_APPLICATION_CREDENTIALS is not set. Run 'gcloud auth login' or set GOOGLE_APPLICATION_CREDENTIALS.}"
+fi
 
 E2E_PREFIX="${E2E_PREFIX:-karpenter-e2e}"
 E2E_REGION="${E2E_REGION:-us-central1}"
@@ -30,9 +43,31 @@ CLUSTER_NAME="${E2E_PREFIX}-cluster"
 GSA_ID="${E2E_PREFIX}-karpenter"
 GSA_EMAIL="${GSA_ID}@${E2E_PROJECT_ID}.iam.gserviceaccount.com"
 
-REPO_ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
+"${REPO_ROOT}/hack/e2e-clean-env.sh"
 
 log() { echo "e2e-deploy: $*" >&2; }
+
+# The chart's controller.priorityClassName defaults to gmp-critical, a class the
+# GMP operator creates. Clusters without managed Prometheus have no GMP, so the
+# controller pod is otherwise rejected by the PriorityClass admission plugin.
+# Create it only when missing, so a GMP-managed class is never overwritten.
+# GMP leaves preemptionPolicy at its default; this fixture disables preemption
+# so the controller cannot evict test workloads.
+if kubectl get priorityclass gmp-critical >/dev/null 2>&1; then
+  log "Reusing gmp-critical PriorityClass"
+else
+  log "Creating gmp-critical PriorityClass (chart default; no GMP operator on this cluster)"
+  kubectl create -f - <<'MANIFEST'
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: gmp-critical
+description: Used for GMP collector pods.
+value: 1000000000
+globalDefault: false
+preemptionPolicy: Never
+MANIFEST
+fi
 
 # Common helm values regardless of mode
 HELM_COMMON_ARGS=(
@@ -44,12 +79,17 @@ HELM_COMMON_ARGS=(
   --set controller.settings.clusterLocation="${E2E_LOCATION}"
   --set controller.featureGates.spotToSpotConsolidation=true
   --set controller.featureGates.nodeRepair=true
+  --set controller.featureGates.nodeOverlay=true
+  --set controller.featureGates.staticCapacity=true
   --set "serviceAccount.annotations.iam\\.gke\\.io/gcp-service-account=${GSA_EMAIL}"
   --set controller.replicaCount=1
   --set credentials.enabled=false
   --wait
   --timeout 5m
 )
+if [[ -n "${E2E_NODE_SERVICE_ACCOUNT:-}" ]]; then
+  HELM_COMMON_ARGS+=(--set-string "controller.settings.defaultNodepoolServiceAccount=${E2E_NODE_SERVICE_ACCOUNT}")
+fi
 
 if [[ -n "${RELEASE_VERSION}" ]]; then
   # --- Published release mode ---

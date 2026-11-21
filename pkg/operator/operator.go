@@ -23,12 +23,15 @@ import (
 	"regexp"
 	"strings"
 
+	computeapi "cloud.google.com/go/compute/apiv1"
 	"github.com/samber/lo"
 	"google.golang.org/api/compute/v1"
 	container "google.golang.org/api/container/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/controllers/nodeclaim/lifecycle"
 	"sigs.k8s.io/karpenter/pkg/operator"
 
 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/auth"
@@ -41,6 +44,7 @@ import (
 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/providers/offerings/unavailableofferings"
 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/providers/pricing"
 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/providers/pricing/instanceprice"
+	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/providers/subnet"
 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/providers/version"
 )
 
@@ -57,10 +61,16 @@ type Operator struct {
 	PricingProvider           pricing.Provider
 	InstanceTypeProvider      instancetype.Provider
 	InstanceProvider          instance.Provider
+	GKEProvider               gke.Provider
+	SubnetProvider            subnet.Provider
+	AuthOptions               *auth.Credential
 }
 
 func NewOperator(ctx context.Context, operator *operator.Operator) (context.Context, *Operator) {
 	os.Setenv(options.GCPAuth, options.FromContext(ctx).GCPAuth)
+	// Core reads this package variable from its liveness controller, which
+	// starts after NewOperator returns.
+	lifecycle.LaunchTimeout = options.FromContext(ctx).LaunchTimeout
 
 	region, err := determineRegion(ctx, options.FromContext(ctx).ProjectID, options.FromContext(ctx).ClusterLocation)
 	if err != nil {
@@ -122,13 +132,20 @@ func NewOperator(ctx context.Context, operator *operator.Operator) (context.Cont
 	imageProvider := imagefamily.NewDefaultProvider(computeService, versionProvider, gkeProvider)
 
 	projectID := options.FromContext(ctx).ProjectID
-	computeDefaultSA := ""
-	if proj, err := computeService.Projects.Get(projectID).Context(ctx).Do(); err != nil {
-		log.FromContext(ctx).Error(err, "failed to get Compute Engine default service account; nodes without an explicit serviceAccount will fail to provision")
-	} else {
-		computeDefaultSA = proj.DefaultServiceAccount
+	computeDefaultSA, err := getComputeDefaultServiceAccount(ctx, computeService, projectID, options.FromContext(ctx).NodePoolServiceAccount)
+	if err != nil {
+		log.FromContext(ctx).Error(err, "failed to get Compute Engine default service account")
+		os.Exit(1)
 	}
 
+	subnetClient, err := computeapi.NewSubnetworksRESTClient(ctx)
+	if err != nil {
+		log.FromContext(ctx).Error(err, "failed to initialize subnetwork client")
+		os.Exit(1)
+	}
+	subnetProvider := subnet.NewProvider(subnetClient, region, clock.RealClock{})
+
+	instanceTypeProvider := instancetype.NewDefaultProvider(ctx, &auth, pricingProvider, gkeProvider, unavailableOfferingsCache, operator.GetClient())
 	instanceProvider := instance.NewProvider(
 		options.FromContext(ctx).ClusterName,
 		options.FromContext(ctx).ClusterLocation,
@@ -138,11 +155,12 @@ func NewOperator(ctx context.Context, operator *operator.Operator) (context.Cont
 		computeDefaultSA,
 		computeService,
 		gkeProvider,
+		subnetProvider,
+		instanceTypeProvider,
 		nodeTemplateProvider,
 		versionProvider,
 		unavailableOfferingsCache,
 	)
-	instanceTypeProvider := instancetype.NewDefaultProvider(ctx, &auth, pricingProvider, gkeProvider, unavailableOfferingsCache)
 
 	return ctx, &Operator{
 		Operator:                  operator,
@@ -152,7 +170,21 @@ func NewOperator(ctx context.Context, operator *operator.Operator) (context.Cont
 		PricingProvider:           pricingProvider,
 		InstanceTypeProvider:      instanceTypeProvider,
 		InstanceProvider:          instanceProvider,
+		GKEProvider:               gkeProvider,
+		SubnetProvider:            subnetProvider,
+		AuthOptions:               &auth,
 	}
+}
+
+func getComputeDefaultServiceAccount(ctx context.Context, computeService *compute.Service, projectID, configuredAccount string) (string, error) {
+	if configuredAccount != "" {
+		return "", nil
+	}
+	project, err := computeService.Projects.Get(projectID).Context(ctx).Do()
+	if err != nil {
+		return "", err
+	}
+	return project.DefaultServiceAccount, nil
 }
 
 func determineRegion(ctx context.Context, projectID, location string) (string, error) {

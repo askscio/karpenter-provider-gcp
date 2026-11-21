@@ -1,9 +1,158 @@
 # Migration Guide
 
-> For a full list of changes per release, see [GitHub Releases](https://github.com/cloudpilot-ai/karpenter-provider-gcp/releases).
-> This file documents only breaking changes and steps required when upgrading.
+> For a full list of changes per release, see [GitHub Releases](https://github.com/cloudpilot-ai/karpenter-provider-gcp/releases). This file documents only breaking changes and steps required when upgrading.
 
 ## Unreleased
+
+## v0.8.0
+
+### Source-pool swap and zswap settings are no longer inherited
+
+New nodes no longer inherit swap or zswap settings from the GKE bootstrap source pool, even when `linuxNodeConfig.swapConfig` is omitted. Existing nodes are unchanged. If you relied on inherited boot-disk swap, configure `spec.linuxNodeConfig.swapConfig.enabled: true` before provisioning replacement nodes. Other swap profiles and zswap are not supported by this field. See [Swap](docs/examples/advanced.md#swap).
+
+### On-demand shutdown settings no longer depend on the source pool
+
+New on-demand nodes use `0s` for both kubelet shutdown grace periods instead of inheriting shutdown settings from the bootstrap source node pool. Priority-based shutdown periods from the source are also discarded. Spot defaults remain `30s` total and `15s` for critical pods.
+
+If you relied on source-pool graceful shutdown, set the desired values explicitly on each affected GCENodeClass before provisioning replacement nodes:
+
+```yaml
+spec:
+  kubeletConfiguration:
+    shutdownGracePeriod: 30s
+    shutdownGracePeriodCriticalPods: 15s
+```
+
+This changes newly provisioned nodes only; existing nodes are not reconfigured in place. Changing NodeClass settings can trigger normal drift replacement. No hash-version bump or forced rollout is introduced for the default-policy change. See [Graceful node shutdown](docs/examples/advanced.md#graceful-node-shutdown).
+
+### Telemetry is off by default
+
+The controller no longer sends resource totals and Spot interruption events to CloudPilot AI unless `TELEMETRY` is `true` (Helm: `controller.settings.telemetry`). To keep sending them, set it to `true`. See [Telemetry](docs/settings.md#telemetry).
+
+### Instance types that hit GCE quota are skipped for 30 minutes
+
+A launch can fail because a GCE project quota, such as `N2_CPUS` or `NVIDIA_L4_GPUS`, is exhausted (`QUOTA_EXCEEDED`). Karpenter now marks that instance type unavailable for the same capacity type in every zone of the region for 30 minutes. New NodeClaims try other instance types instead of retrying the quota-blocked one. A Spot NodeClaim whose Spot attempts all fail for capacity or quota can fall back to on-demand. Previously, every new NodeClaim retried the same instance type.
+
+No action required. To change the backoff, set `QUOTA_EXCEEDED_TTL` (Helm: `controller.settings.quotaExceededTTL`), for example to `1h`. To keep the previous behavior, set it to `0s`. Negative values stop the controller at startup. After you raise a quota, the instance type stays unavailable until the TTL expires or the controller restarts. See [Quota exhaustion](docs/settings.md#quota-exhaustion).
+
+### Container-Optimized OS images are ranked per variant
+
+COS `latest` now selects the newest usable image independently for amd64 CPU, arm64 CPU, and NVIDIA, falling back to older compatible catalog entries during publication. `ImagesReady=True` can contain a partial set: only supported instance types launch, and image drift waits for a compatible replacement. Channel and version pins remain exact; Ubuntu selection is unchanged.
+
+No API changes or migration action required. See [COS image selection](docs/image-selection.md#container-optimized-os-variants) and [readiness conditions](docs/troubleshooting.md#gcenodeclass-not-becoming-ready), including the new `ImageUnavailable` and `ImageLookupFailed` reasons.
+
+### Default node service account lookup failures now stop startup
+
+When `DEFAULT_NODEPOOL_SERVICE_ACCOUNT` is unset, the controller now exits if the Compute Engine project lookup fails, rather than continuing with an unresolved default service account. Pod restarts retry the lookup. This also applies when every `GCENodeClass` sets `spec.serviceAccount`.
+
+Ensure the controller can reach the Compute Engine API and has the existing `compute.projects.get` permission, or set `DEFAULT_NODEPOOL_SERVICE_ACCOUNT` (Helm: `controller.settings.defaultNodepoolServiceAccount`) to skip this lookup. NodeClass-level service accounts still take precedence. No new IAM permission is required.
+
+### New IAM permission required for resource manager tags: `compute.instances.createTagBinding`
+
+Setting the new `GCENodeClass.spec.resourceManagerTags` field requires the controller's service account to have `compute.instances.createTagBinding` on the project, which is now included in [`deploy/iam/karpenter-controller-role.yaml`](deploy/iam/karpenter-controller-role.yaml). If you created the `karpenter_controller` custom role from an earlier version of that file, update it with `gcloud iam roles update` before you set `resourceManagerTags`; without it, instance creation fails for that NodeClass. The service account also needs `roles/resourcemanager.tagUser` on the tag values, their tag key, or a parent resource. No action is required if you don't use `resourceManagerTags`. See [Resource manager tags](docs/examples/networking.md#resource-manager-tags).
+
+### Persistent disks now carry Karpenter ownership labels: `compute.disks.setLabels` required for all NodeClasses
+
+New persistent disks created from `spec.disks`, including the boot disk, now carry the same Karpenter labels as their VM: `karpenter-sh-nodepool`, `karpenter-k8s-gcp-gcenodeclass`, `goog-k8s-cluster-name`, and `goog-k8s-cluster-location`. Use them to attribute disk costs or find disks by NodePool, NodeClass, or cluster. These labels take precedence over `spec.labels` entries with the same keys. Existing disks are not relabeled.
+
+**Action required:** every NodeClass now creates labeled disks, so the controller's service account needs `compute.disks.setLabels` even when `spec.labels` is empty. If you created the `karpenter_controller` custom role without it, update the role from [`deploy/iam/karpenter-controller-role.yaml`](deploy/iam/karpenter-controller-role.yaml) before upgrading; otherwise, provisioning fails.
+
+### `deploy/terraform/` module: Dataplane V2, system node pool, and release channel
+
+If you manage a cluster with [`deploy/terraform/`](deploy/terraform/), review `terraform plan` before you apply this version. Three changes affect clusters the module already created:
+
+- **Dataplane V2 by default.** `datapath_provider` defaults to `ADVANCED_DATAPATH` (GKE Dataplane V2), which routes Services with Cilium/eBPF instead of kube-proxy and always enforces NetworkPolicy. GKE sets the datapath only at cluster creation, so applying the new default replaces an existing cluster. To keep your cluster, set `datapath_provider = "LEGACY_DATAPATH"`.
+- **New system node pool.** The module now creates a node pool named `${common_name}-system` for Karpenter and essential cluster workloads. Karpenter doesn't manage it. It defaults to one `n2-standard-2` node per zone, so a regional cluster gets one node in each of its zones. To run fewer nodes, set `system_node_locations` to a single zone. Adjust size with `system_machine_type`, `system_node_count`, and `system_disk_size_gb`.
+- **Explicit release channel.** The cluster is enrolled in `release_channel`, which defaults to `STABLE`. If your cluster uses another channel, set `release_channel` to that channel to keep it.
+
+The module also no longer declares its own `provider "google"` block. Configure the provider in your root configuration when you call it as a module. Resource names, CIDR ranges, and the logging and monitoring settings keep their previous defaults. See [`deploy/terraform/README.md`](deploy/terraform/README.md) for all inputs.
+
+### Karpenter core v1.15: node repair and disruption metrics
+
+`NodeRepair` remains disabled by default. If you already enable it, repair now uses the modern voluntary disruption method: initialized-node repairs respect budgets applying to `Unhealthy` (including budgets with no `reasons`), the Node's `karpenter.sh/do-not-repair` annotation, and replacement feasibility. An all-reason `nodes: "0"` budget now blocks these repairs. Replacement capacity is initialized before the unhealthy NodeClaim is deleted; unavailable capacity or scheduling constraints can delay repair. GCP's condition tolerations and forceful, zero-grace termination after staging are unchanged.
+
+To retain the previous forceful repair controller, explicitly set:
+
+```yaml
+controller:
+  featureGates:
+    nodeRepair: true
+  settings:
+    legacyNodeRepair: true
+```
+
+Otherwise, review your disruption budgets before upgrading. Restrict consolidation-only budgets to `Empty`, `Underutilized` and `Drifted`, and adjust any remaining restrictive budgets applying to repair. You may then add an appropriate `Unhealthy` budget. The most restrictive matching budget wins: an `Unhealthy` budget cannot override an all-reason `nodes: "0"` budget. See [Node repair](docs/node-repair.md).
+
+Upgrade the Karpenter CRDs alongside the controller before using `Unhealthy` budget reasons. Helm does not upgrade CRDs in the controller chart's `crds/` directory; use the project's CRD upgrade procedure or upgrade the separate `karpenter-crd` release. Custom Kubernetes RBAC must now permit `get`, `list` and `watch` on Services; opting into `podDeletionCostManagement` also requires `patch` on Pods. No new GCP IAM permissions are required.
+
+Disruption metrics now use lowercase reason values and add `consolidation_policy` and `termination_mode` dimensions. Update dashboards, alerts and recording rules that filter old reason values or depend on the previous label set. Metric reason values are lowercase; NodePool budget reasons remain capitalized.
+
+`spec.disruption.consolidateAfter` is now optional and defaults to `0s`. Existing explicit values are unchanged. When adopting manifests that omit it, set a delay or `Never` if immediate consolidation eligibility is not intended.
+
+The new terminate-first and pod deletion-cost gates remain disabled by default. Dynamic terminate-first still requires reserved capacity, which GCP does not support; static NodePool node-limit handling is available. Native reboot and pre-registration CSI attachment-limit predictions are not implemented by this migration. See [Settings](docs/settings.md) for opt-in behavior and limitations.
+
+### Corrected disk compatibility for C4A and N4
+
+New C4A and N4 nodes no longer advertise `disk-type.gke.io/pd-balanced` or `disk-type.gke.io/pd-ssd`. Karpenter excludes these families when workloads require either label.
+
+Existing Nodes and NodeClaims retain their old labels. Replace affected nodes or remove both unsupported labels from affected Nodes and NodeClaims before relying on disk topology for placement. This change does not migrate disks or add disk affinity to existing PersistentVolumes.
+
+### Adopting the bare-metal selector
+
+No configuration changes are required when upgrading. The new `karpenter.k8s.gcp/instance-bare-metal` label does not change instance selection or cause drift unless you add requirements that use it.
+
+The following caveats apply only when adopting the new label on an existing pool. Existing Nodes and NodeClaims do not receive the label automatically.
+
+Use `In ["false"]` to require VMs, or `In ["true"]` to require bare metal. Both reject unlabeled legacy nodes. Adding either requirement to a NodePool marks unlabeled legacy NodeClaims as drifted. Replacement follows normal disruption controls. Pods that explicitly select this label cannot use unlabeled existing Nodes. Karpenter may provision a new matching node even when those existing Nodes have spare capacity.
+
+## v0.7.0
+
+### Multiple pod CIDR ranges on GCENodeClass
+
+`GCENodeClass` now accepts `spec.subnetRangeNames`, a list of GKE secondary IPv4 range names for pod alias IPs. When more than one name is eligible, Karpenter prefers the range with the most Compute-reported free IPv4 addresses and retries remaining names if Compute returns IP space exhausted. Resolved names and optional integer `totalFreeIP` counts are published on `status.subnetRanges`.
+
+`spec.subnetRangeName` is deprecated but remains supported for backward compatibility. Use `spec.subnetRangeNames` instead, even for a single range. The two fields are mutually exclusive. Either field completely replaces the discovered range list; overrides are not merged with cluster ranges. If neither is set, Karpenter now considers the cluster default plus additional pod ranges reported by GKE on the primary subnetwork.
+
+**Recommended migration:** replace `subnetRangeName: pods` with `subnetRangeNames: [pods]`, using your existing range name, and remove `subnetRangeName`. No immediate action is required; removal of the deprecated field will be announced separately. Migrating from `subnetRangeName` to `subnetRangeNames` marks existing nodes as drifted and may cause Karpenter to replace them.
+
+**Default behavior change:** NodeClasses with both fields omitted can now allocate from additional cluster pod ranges. To retain default-range-only allocation, set `subnetRangeNames: [CLUSTER_DEFAULT_RANGE_NAME]`. Otherwise, omit both fields to use all cluster-level ranges, or set `subnetRangeNames` to restrict allocation to specific ranges. Ranges on separate additional subnetworks are not discovered.
+
+**Capacity reporting:** `status.subnetRanges[].totalFreeIP` is optional. Zero is a reported count; an omitted count means unknown capacity. Counts are cached for one minute and do not guarantee an allocatable contiguous pod CIDR block. A failed or timed-out capacity read leaves launch order unchanged and clears status counts; allocation still relies on Compute insertion and range fallback.
+
+The controller now reads `subnetworks.get` with `WITH_UTILIZATION` for capacity. The custom role already includes `compute.subnetworks.get`; ensure the controller also has that permission in any Shared VPC host project containing the target subnetwork. No new IAM permission is added.
+
+### New IAM permission required: `compute.machineTypes.get`
+
+Registering a `GCECustomMachineType` requires the controller's service account to have `compute.machineTypes.get`, in addition to the existing `compute.machineTypes.list`. Add it to your controller's IAM role before upgrading; see [`deploy/iam/karpenter-controller-role.yaml`](deploy/iam/karpenter-controller-role.yaml). Without it, every `GCECustomMachineType` registration is treated as a transient failure and retried rather than marked `Ready=False` — it stays stuck at `Ready=Unknown` indefinitely instead of surfacing a clear error, so check the controller logs for `PermissionDenied` if a registration never becomes `Ready`.
+
+### NodeClass labels now apply to newly provisioned persistent disks
+
+`GCENodeClass.spec.labels` now applies to the VM instance and all persistent disks created from `spec.disks`, including the boot disk. Existing disks are not relabeled by this change, and local SSDs and CSI-managed volumes are outside its scope.
+
+**Action required:** update the controller's custom IAM role from [`deploy/iam/karpenter-controller-role.yaml`](deploy/iam/karpenter-controller-role.yaml) before upgrading. Compute Engine requires `compute.disks.setLabels` when creating a disk with labels through `instances.insert`; without it, provisioning fails for NodeClasses with non-empty `spec.labels`.
+
+### Replace the non-working local SSD disk category
+
+`GCENodeClass.spec.disks[].category: local-ssd` never provisioned local SSDs successfully and is no longer accepted by the CRD. If your NodeClass uses it, remove that disk entry before upgrading the CRD. To provision local SSDs, use `spec.localSsdMode` (`RawBlock` by default; set `Ephemeral` for kubelet storage). For configurable machine families (`n1`, `n2`, `n2d`, `c2`, `c2d`), declare `karpenter.k8s.gcp/instance-local-ssd-count` on the NodePool and select one exact count through the NodePool or Pod requirements. Fixed-count local SSD machine types, such as `c4d-standard-8-lssd`, do not need a Pod count selector. See [Proposal 0003](proposals/0003-local-ssd-support.md#migration) for examples.
+
+---
+
+## v0.6.0
+
+### CapacityBuffer requires the CRD to already be installed; the CRD is not installed by this provider
+
+This provider does not ship the `CapacityBuffer` CRD in either the `karpenter` or `karpenter-crd` chart. GKE provides it natively starting at `1.35.2-gke.1842000`. Setting `controller.featureGates.capacityBuffer: true` now checks the cluster for the CRD (`autoscaling.x-k8s.io/v1beta1/CapacityBuffer`) at Helm template time and fails the install/upgrade if it isn't present, instead of silently enabling a feature the controller can't back with a CRD.
+
+### Unsupported instance labels removed
+
+The provider no longer registers or exposes the following GCP instance labels:
+
+- `karpenter.k8s.gcp/instance-category`
+- `karpenter.k8s.gcp/instance-cpu-model`
+
+`instance-category` was derived from the leading letters of the machine family, but those letters do not match GCP's machine categories. For example, `c2` and `c2d` are compute-optimized, while `c3`, `c3d`, and `c4` are general-purpose. `instance-cpu-model` was registered but never populated.
+
+**Action required:** remove these labels from NodePool requirements and workload scheduling constraints before upgrading. Use `karpenter.k8s.gcp/instance-family` when you need to target specific GCP machine families.
 
 ---
 
@@ -79,21 +228,17 @@ Newly honoured fields:
 The CRD value schema for `systemReserved`, `kubeReserved`, `evictionHard`, and `evictionSoft` is now validated against the `resource.Quantity` regex (and percentage syntax for the eviction fields). Existing values that already parsed as `resource.Quantity` are unaffected.
 
 ---
+
 ### GPU node provisioning (`gpuDriverVersion`)
 
-Karpenter now automatically sets the two node labels required by the GKE GPU software stack
-at boot time:
+Karpenter now automatically sets the two node labels required by the GKE GPU software stack at boot time:
 
 - `cloud.google.com/gke-accelerator=<type>` — required by the NVIDIA device plugin DaemonSet.
 - `cloud.google.com/gke-gpu-driver-version=<value>` — read by the GKE GPU driver installer.
 
-The driver version is controlled by the new `spec.gpuDriverVersion` field on `GCENodeClass`
-(default: `"default"`, matching GKE's native behaviour).
+The driver version is controlled by the new `spec.gpuDriverVersion` field on `GCENodeClass` (default: `"default"`, matching GKE's native behaviour).
 
-**Action required if you set `cloud.google.com/gke-gpu-driver-version` via NodePool
-`spec.template.spec.labels`:** remove the label from the NodePool and set
-`spec.gpuDriverVersion` on `GCENodeClass` instead — it is now injected at boot time,
-before the driver installer runs.
+**Action required if you set `cloud.google.com/gke-gpu-driver-version` via NodePool `spec.template.spec.labels`:** remove the label from the NodePool and set `spec.gpuDriverVersion` on `GCENodeClass` instead — it is now injected at boot time, before the driver installer runs.
 
 ```yaml
 # Before — NodePool:
@@ -239,9 +384,7 @@ gcloud projects remove-iam-policy-binding $PROJECT_ID \
     --role="roles/container.admin"
 ```
 
-**Using Terraform?** The [`deploy/terraform/`](../deploy/terraform/) module handles all of the
-above automatically — it creates the controller SA, the minimal custom role (sourced from
-`deploy/iam/karpenter-controller-role.yaml`), and the project IAM binding in one apply:
+**Using Terraform?** The [`deploy/terraform/`](deploy/terraform/) module handles all of the above automatically — it creates the controller SA, the minimal custom role (sourced from `deploy/iam/karpenter-controller-role.yaml`), and the project IAM binding in one apply:
 
 ```hcl
 module "karpenter_iam" {
@@ -256,9 +399,7 @@ Run `terraform apply` and then remove the old broad bindings with the `gcloud` c
 
 **Action required if you followed the previous installation guide.**
 
-The previous guide granted `roles/iam.serviceAccountUser` at project level (actAs any SA in the
-project). This should be scoped to only the SA(s) Karpenter attaches to nodes. Add the scoped
-binding before removing the broad one to avoid a permission gap:
+The previous guide granted `roles/iam.serviceAccountUser` at project level (actAs any SA in the project). This should be scoped to only the SA(s) Karpenter attaches to nodes. Add the scoped binding before removing the broad one to avoid a permission gap:
 
 ```sh
 # Add the SA-scoped binding first to avoid a permission gap.
@@ -275,19 +416,13 @@ gcloud projects remove-iam-policy-binding $PROJECT_ID \
     --role="roles/iam.serviceAccountUser"
 ```
 
-If you override the node SA via `GCENodeClass.spec.serviceAccount` or `--node-pool-service-account`,
-repeat the `add-iam-policy-binding` step for each SA you use.
+If you override the node SA via `GCENodeClass.spec.serviceAccount` or `--node-pool-service-account`, repeat the `add-iam-policy-binding` step for each SA you use.
 
 ### Use a dedicated minimal-privilege node service account (recommended)
 
-**No immediate action required.** This section documents the recommended hardening step for new
-and existing installations. Karpenter continues to work with the Compute Engine default SA if you
-skip it.
+**No immediate action required.** This section documents the recommended hardening step for new and existing installations. Karpenter continues to work with the Compute Engine default SA if you skip it.
 
-By default, Karpenter attaches the Compute Engine default SA
-(`<project-number>-compute@developer.gserviceaccount.com`) to provisioned nodes. This SA carries
-broad `roles/editor`-equivalent permissions. Creating a dedicated node SA with only the
-permissions GKE nodes actually need reduces blast radius if a node is compromised.
+By default, Karpenter attaches the Compute Engine default SA (`<project-number>-compute@developer.gserviceaccount.com`) to provisioned nodes. This SA carries broad `roles/editor`-equivalent permissions. Creating a dedicated node SA with only the permissions GKE nodes actually need reduces blast radius if a node is compromised.
 
 Create and configure the dedicated SA:
 
@@ -334,8 +469,7 @@ Tell Karpenter to use the new SA. Choose one of:
     serviceAccount: karpenter-node@<project-id>.iam.gserviceaccount.com
   ```
 
-Once nodes are rolling with the new SA, optionally revoke `iam.serviceAccountUser` from the
-Compute Engine default SA to close the broad binding:
+Once nodes are rolling with the new SA, optionally revoke `iam.serviceAccountUser` from the Compute Engine default SA to close the broad binding:
 
 ```sh
 gcloud iam service-accounts remove-iam-policy-binding \
@@ -447,35 +581,20 @@ Previously, Karpenter merged all tags from the bootstrap node pool template with
 
 #### Background
 
-This release introduces a garbage-collection controller that automatically deletes GCE VM
-instances with no corresponding NodeClaim (orphaned instances that accumulate after missed
-deletes, controller restarts, or direct NodeClaim deletions).
+This release introduces a garbage-collection controller that automatically deletes GCE VM instances with no corresponding NodeClaim (orphaned instances that accumulate after missed deletes, controller restarts, or direct NodeClaim deletions).
 
 Karpenter identifies instances that belong to this cluster using two GCE labels:
 
-- `goog-k8s-cluster-name` — already present on all Karpenter-managed instances; used as a
-  server-side filter in GCE API calls.
-- `goog-k8s-cluster-location` — new in this release; stamped on every instance at creation
-  time and checked in-process to distinguish clusters that share the same name in different
-  GCP locations.
+- `goog-k8s-cluster-name` — already present on all Karpenter-managed instances; used as a server-side filter in GCE API calls.
+- `goog-k8s-cluster-location` — new in this release; stamped on every instance at creation time and checked in-process to distinguish clusters that share the same name in different GCP locations.
 
-Instances with `goog-k8s-cluster-location` present are eligible for automatic GC.
-Instances without it — created by an older Karpenter version — remain in the instance
-cache (so Karpenter retains control of them) but are **never** touched by the GC
-controller. This means upgrading is safe: no nodes are deleted on upgrade, and existing
-nodes stay fully managed until they are naturally replaced by a newer Karpenter version
-that stamps the label.
+Instances with `goog-k8s-cluster-location` present are eligible for automatic GC. Instances without it — created by an older Karpenter version — remain in the instance cache (so Karpenter retains control of them) but are **never** touched by the GC controller. This means upgrading is safe: no nodes are deleted on upgrade, and existing nodes stay fully managed until they are naturally replaced by a newer Karpenter version that stamps the label.
 
-The upgrade itself requires no action. The steps below are **optional** and only relevant
-if you want to clean up orphaned instances that may have accumulated before this release
-(see #242). Future orphaned instances on new-style nodes are handled automatically.
+The upgrade itself requires no action. The steps below are **optional** and only relevant if you want to clean up orphaned instances that may have accumulated before this release (see #242). Future orphaned instances on new-style nodes are handled automatically.
 
 #### Step 1 (optional) — rotate live nodes
 
-Trigger a rolling replacement of your NodePools so that every replacement instance is
-stamped with `goog-k8s-cluster-location`. After this step, any remaining instance that
-still lacks the label is confirmed to have no live workload and is safe to treat as an
-orphan.
+Trigger a rolling replacement of your NodePools so that every replacement instance is stamped with `goog-k8s-cluster-location`. After this step, any remaining instance that still lacks the label is confirmed to have no live workload and is safe to treat as an orphan.
 
 ```bash
 kubectl annotate nodepool <NODEPOOL_NAME> "karpenter.k8s.gcp/force-rollout=$(date +%s)" --overwrite

@@ -18,7 +18,9 @@ package interruption
 
 import (
 	"context"
+	"errors"
 	"testing"
+	"time"
 
 	opmetrics "github.com/awslabs/operatorpkg/metrics"
 	"github.com/prometheus/client_golang/prometheus"
@@ -31,15 +33,18 @@ import (
 	karpevents "sigs.k8s.io/karpenter/pkg/events"
 	karpmetrics "sigs.k8s.io/karpenter/pkg/metrics"
 
+	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/providers/offerings/unavailableofferings"
 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/utils"
 )
 
 // fakeKubeClient embeds client.Client and overrides only the methods used by the controller.
 type fakeKubeClient struct {
 	client.Client
-	nodes      []corev1.Node
-	nodeClaims []karpv1.NodeClaim
-	deleted    []client.Object
+	nodes            []corev1.Node
+	nodeClaims       []karpv1.NodeClaim
+	deleted          []client.Object
+	nodeClaimListErr error
+	deleteErr        error
 }
 
 func (f *fakeKubeClient) List(_ context.Context, list client.ObjectList, _ ...client.ListOption) error {
@@ -47,12 +52,18 @@ func (f *fakeKubeClient) List(_ context.Context, list client.ObjectList, _ ...cl
 	case *corev1.NodeList:
 		v.Items = f.nodes
 	case *karpv1.NodeClaimList:
+		if f.nodeClaimListErr != nil {
+			return f.nodeClaimListErr
+		}
 		v.Items = f.nodeClaims
 	}
 	return nil
 }
 
 func (f *fakeKubeClient) Delete(_ context.Context, obj client.Object, _ ...client.DeleteOption) error {
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
 	f.deleted = append(f.deleted, obj)
 	return nil
 }
@@ -98,9 +109,11 @@ func TestDeleteNodeClaim_IncrementsDisruptedMetric(t *testing.T) {
 	}
 
 	labels := prometheus.Labels{
-		karpmetrics.ReasonLabel:       InterruptionReason,
-		karpmetrics.NodePoolLabel:     "test-pool",
-		karpmetrics.CapacityTypeLabel: karpv1.CapacityTypeSpot,
+		karpmetrics.ReasonLabel:              InterruptionReason,
+		karpmetrics.NodePoolLabel:            "test-pool",
+		karpmetrics.CapacityTypeLabel:        karpv1.CapacityTypeSpot,
+		karpmetrics.ConsolidationPolicyLabel: "",
+		karpmetrics.TerminationModeLabel:     karpmetrics.TerminationModeGraceful,
 	}
 	before := disruptedCounterValue(t, labels)
 
@@ -181,9 +194,11 @@ func TestHandleStoppingSpotInstances_DeletesShuttingDownKarpenterNode(t *testing
 	}
 
 	labels := prometheus.Labels{
-		karpmetrics.ReasonLabel:       InterruptionReason,
-		karpmetrics.NodePoolLabel:     "my-pool",
-		karpmetrics.CapacityTypeLabel: karpv1.CapacityTypeSpot,
+		karpmetrics.ReasonLabel:              InterruptionReason,
+		karpmetrics.NodePoolLabel:            "my-pool",
+		karpmetrics.CapacityTypeLabel:        karpv1.CapacityTypeSpot,
+		karpmetrics.ConsolidationPolicyLabel: "",
+		karpmetrics.TerminationModeLabel:     karpmetrics.TerminationModeGraceful,
 	}
 	before := disruptedCounterValue(t, labels)
 
@@ -193,4 +208,173 @@ func TestHandleStoppingSpotInstances_DeletesShuttingDownKarpenterNode(t *testing
 	require.Len(t, kubeClient.deleted, 1)
 	require.Equal(t, "spot-claim", kubeClient.deleted[0].GetName())
 	require.Equal(t, before+1, disruptedCounterValue(t, labels))
+}
+
+func preemptingNodeAndClaim(status corev1.ConditionStatus) *fakeKubeClient {
+	return &fakeKubeClient{
+		nodes: []corev1.Node{
+			{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:   "spot-node",
+					Labels: map[string]string{utils.LabelNodePoolKey: "preempt-pool"},
+				},
+				Status: corev1.NodeStatus{
+					Conditions: []corev1.NodeCondition{
+						{
+							Type:    NodeConditionTypeGCESpotPreempting,
+							Status:  status,
+							Reason:  "SpotPreemptionImminent",
+							Message: "instance is being preempted",
+						},
+					},
+				},
+			},
+		},
+		nodeClaims: []karpv1.NodeClaim{
+			{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "spot-claim",
+					Labels: map[string]string{
+						karpv1.NodePoolLabelKey:        "preempt-pool",
+						karpv1.CapacityTypeLabelKey:    karpv1.CapacityTypeSpot,
+						corev1.LabelTopologyZone:       "us-central1-a",
+						corev1.LabelInstanceTypeStable: "n2d-standard-4",
+					},
+				},
+				Status: karpv1.NodeClaimStatus{NodeName: "spot-node"},
+			},
+		},
+	}
+}
+
+func TestHandleStoppingSpotInstances_DeletesPreemptingNode(t *testing.T) {
+	t.Parallel()
+
+	recorder := &fakeRecorder{}
+	kubeClient := preemptingNodeAndClaim(corev1.ConditionTrue)
+	unavailableOfferings := unavailableofferings.NewUnavailableOfferings()
+
+	c := &Controller{
+		kubeClient:                kubeClient,
+		recorder:                  recorder,
+		unavailableOfferingsCache: unavailableOfferings,
+	}
+
+	labels := prometheus.Labels{
+		karpmetrics.ReasonLabel:              InterruptionReason,
+		karpmetrics.NodePoolLabel:            "preempt-pool",
+		karpmetrics.CapacityTypeLabel:        karpv1.CapacityTypeSpot,
+		karpmetrics.ConsolidationPolicyLabel: "",
+		karpmetrics.TerminationModeLabel:     karpmetrics.TerminationModeGraceful,
+	}
+	before := disruptedCounterValue(t, labels)
+
+	err := c.handleStoppingSpotInstances(context.Background())
+	require.NoError(t, err)
+
+	require.Len(t, kubeClient.deleted, 1)
+	require.Equal(t, "spot-claim", kubeClient.deleted[0].GetName())
+	require.Equal(t, before+1, disruptedCounterValue(t, labels))
+
+	// Unlike the kubelet shutdown path, preemption pulls the offering out of
+	// rotation so the scheduler stops picking it while capacity is reclaimed.
+	require.True(t, unavailableOfferings.IsUnavailable("n2d-standard-4", "us-central1-a", karpv1.CapacityTypeSpot))
+
+	require.Len(t, recorder.events, 2)
+	require.Equal(t, "PreemptionNoticeReceived", recorder.events[0].Reason)
+	require.Equal(t, "TerminatingOnInterruption", recorder.events[1].Reason)
+}
+
+func TestReconcile_ContinuesAfterOrphanedNode(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name      string
+		condition corev1.NodeCondition
+	}{
+		{
+			name: "shutting-down",
+			condition: corev1.NodeCondition{
+				Type:    corev1.NodeReady,
+				Status:  corev1.ConditionFalse,
+				Reason:  NodeConditionReasonKubeletNotReady,
+				Message: NodeConditionMessageShuttingDown,
+			},
+		},
+		{
+			name: "preempting",
+			condition: corev1.NodeCondition{
+				Type:   NodeConditionTypeGCESpotPreempting,
+				Status: corev1.ConditionTrue,
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			kubeClient := preemptingNodeAndClaim(corev1.ConditionTrue)
+			kubeClient.nodes[0].Status.Conditions = []corev1.NodeCondition{tc.condition}
+			orphan := kubeClient.nodes[0].DeepCopy()
+			orphan.Name = "orphaned-node"
+			kubeClient.nodes = append([]corev1.Node{*orphan}, kubeClient.nodes...)
+			kubeClient.nodeClaims[0].Labels[karpv1.NodePoolLabelKey] = t.Name()
+			c := NewController(kubeClient, &fakeRecorder{}, unavailableofferings.NewUnavailableOfferings())
+
+			result, err := c.Reconcile(context.Background())
+
+			require.NoError(t, err)
+			require.Equal(t, time.Second, result.RequeueAfter)
+			require.Len(t, kubeClient.deleted, 1)
+			require.Equal(t, "spot-claim", kubeClient.deleted[0].GetName())
+		})
+	}
+}
+
+func TestReconcile_PropagatesNodeClaimAPIErrors(t *testing.T) {
+	t.Parallel()
+
+	apiErr := errors.New("kubernetes API unavailable")
+	for _, tc := range []struct {
+		name    string
+		listErr error
+		delErr  error
+	}{
+		{name: "list", listErr: apiErr},
+		{name: "delete", delErr: apiErr},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			kubeClient := preemptingNodeAndClaim(corev1.ConditionTrue)
+			kubeClient.nodeClaimListErr = tc.listErr
+			kubeClient.deleteErr = tc.delErr
+			c := NewController(kubeClient, &fakeRecorder{}, unavailableofferings.NewUnavailableOfferings())
+
+			_, err := c.Reconcile(context.Background())
+
+			require.ErrorIs(t, err, apiErr)
+			require.Empty(t, kubeClient.deleted)
+		})
+	}
+}
+
+func TestHandleStoppingSpotInstances_IgnoresPreemptingConditionFalse(t *testing.T) {
+	t.Parallel()
+
+	recorder := &fakeRecorder{}
+	kubeClient := preemptingNodeAndClaim(corev1.ConditionFalse)
+	unavailableOfferings := unavailableofferings.NewUnavailableOfferings()
+
+	c := &Controller{
+		kubeClient:                kubeClient,
+		recorder:                  recorder,
+		unavailableOfferingsCache: unavailableOfferings,
+	}
+
+	err := c.handleStoppingSpotInstances(context.Background())
+	require.NoError(t, err)
+
+	require.Empty(t, kubeClient.deleted)
+	require.Empty(t, recorder.events)
+	require.False(t, unavailableOfferings.IsUnavailable("n2d-standard-4", "us-central1-a", karpv1.CapacityTypeSpot))
 }

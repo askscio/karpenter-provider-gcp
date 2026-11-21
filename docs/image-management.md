@@ -8,12 +8,14 @@ For an overview of selection modes (channel tracking, version pin, raw image ID)
 
 ## Finding Available Versions
 
+Karpenter only selects images whose GCE status is `READY`. The commands below apply the same filter, so an image that GCP is still publishing doesn't appear until you can use it.
+
 **ContainerOptimizedOS** — replace `1351` with your K8s version digits (e.g. 1.35.1 → 1351):
 
 ```bash
 gcloud compute images list \
   --project=gke-node-images \
-  --filter="name~'^gke-1351-.*-cos-[0-9].*-c-pre$' AND NOT deprecated:*" \
+  --filter="name~'^gke-1351-.*-cos-[0-9].*-c-pre$' AND NOT deprecated:* AND status=READY" \
   --format="value(name)" \
   | sed 's/.*-cos-\([0-9][0-9]*-[0-9][0-9]*-[0-9][0-9]*-[0-9][0-9]*\)-c-pre/\1/' \
   | tr '-' '.' | sort -u
@@ -26,22 +28,55 @@ Sample output:
 125.19216.109.133
 ```
 
+The example lists amd64 CPU images only. To inspect all supported COS variants:
+
+```bash
+gcloud compute images list \
+  --project=gke-node-images \
+  --filter="name~'^gke-1351-gke[0-9]+-cos-.*-(c-pre|c-nvda)$' AND NOT deprecated:* AND status=READY" \
+  --format="value(name)" \
+  | sort
+```
+
 **Ubuntu** — replace `1-35` with your K8s minor version (e.g. 1.35.x → 1-35):
 
 ```bash
 gcloud compute images list \
   --project=ubuntu-os-gke-cloud \
-  --filter="name~'^ubuntu-gke-2404-1-35-amd64-v[0-9].*$' AND NOT deprecated:*" \
+  --filter="name~'^ubuntu-gke-2404-1-35-amd64-v[0-9]+[a-z]?$' AND NOT deprecated:* AND status=READY" \
   --format="value(name)" \
-  | sed 's/.*-\(v[0-9][0-9]*\)$/\1/' | sort -u
+  | grep -oE 'v[0-9]+[a-z]?$' | sort -u
 ```
 
 Sample output:
 
 ```
 v20260401
-v20260416
+v20260416a
 ```
+
+For arm64, change the arch token in the filter (`amd64` → `arm64`):
+
+```bash
+gcloud compute images list \
+  --project=ubuntu-os-gke-cloud \
+  --filter="name~'^ubuntu-gke-2404-1-35-arm64-v[0-9]+[a-z]?$' AND NOT deprecated:* AND status=READY" \
+  --format="value(name)" \
+  | grep -oE 'v[0-9]+[a-z]?$' | sort -u
+```
+
+Sample output:
+
+```
+v20260408
+v20260420a
+```
+
+For Ubuntu 22.04, the `ubuntu-gke-2204` amd64 image names do not carry an `-amd64-` token. Drop the arch token from the amd64 filter: use `^ubuntu-gke-2204-1-35-v[0-9]+[a-z]?$` for amd64 and `^ubuntu-gke-2204-1-35-arm64-v[0-9]+[a-z]?$` for arm64.
+
+> **Note:** A date shown with a trailing letter (for example, `v20260416a`) is a separate build of that date. Pins match exactly: to pin it, include the letter (`version: "v20260416a"`). A pin without the letter (`v20260416`) does not resolve to `v20260416a`, and a letter pin does not resolve to the letterless build. Pin a token that appears in the output for both amd64 and arm64.
+
+> **Note:** Ubuntu pins require a usable catalog image for both architectures. See [Ubuntu selection behavior](image-selection.md#os-families) and [image readiness troubleshooting](troubleshooting.md#gcenodeclass-not-becoming-ready).
 
 ## Controlling Image Replacement
 
@@ -129,6 +164,8 @@ disruption:
       reasons:
         - Drifted
 ```
+
+See [COS variant selection](image-selection.md#container-optimized-os-variants) for fallback and refresh behavior, and [image readiness troubleshooting](troubleshooting.md#gcenodeclass-not-becoming-ready) for condition reasons and retries.
 
 ## Relationship to GKE Cluster Upgrades
 

@@ -31,7 +31,7 @@ Edit `MIGRATION.md`:
 - Move items from the `Unreleased` section into a new `vX.Y.0` section.
 - Leave an empty `Unreleased` section at the top.
 
-Open a _"chore: prepare vX.Y.0 release"_ PR and add the `release-prep` label (excludes it from the auto-generated changelog). Then run the full e2e suite — the PR only touches docs, so this validates the release candidate code before the merge commit is tagged:
+Open a *"chore: prepare vX.Y.0 release"* PR and add the `release-prep` label (excludes it from the auto-generated changelog). Then run the full e2e suite — the PR only touches docs, so this validates the release candidate code before the merge commit is tagged:
 
 ```bash
 make e2e-deploy E2E_PROJECT_ID=<PROJECT_ID> E2E_SA_PATH=<SA_KEY> E2E_LOCATION=<ZONE> E2E_REGION=<REGION>
@@ -111,6 +111,8 @@ curl -s "https://cloudpilot-ai.github.io/karpenter-provider-gcp/index.yaml" \
 ```
 
 Also confirm the new version appears on [ArtifactHub](https://artifacthub.io/packages/helm/karpenter-provider-gcp/karpenter).
+
+> **Check signatures:** Run the commands in [Verify release artifacts](docs/getting-started/installation.md#verify-release-artifacts-optional) with `VERSION=vX.Y.0` (note the leading `v`). This confirms that users can verify the published image signature, chart signatures, and build provenance. Fix any failure before announcing the release.
 
 ### 6. Validate on the e2e cluster
 

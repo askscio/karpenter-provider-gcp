@@ -48,6 +48,26 @@ Pre-load container images onto a secondary boot disk to reduce node startup late
 
 See [`examples/nodeclass/secondary-disk-gcenodeclass.yaml`](https://github.com/cloudpilot-ai/karpenter-provider-gcp/blob/main/examples/nodeclass/secondary-disk-gcenodeclass.yaml).
 
+## Data disks
+
+A `spec.disks[]` entry that is neither the boot disk nor a secondary boot disk attaches a blank persistent disk. It is created with the VM and deleted with it. Set `deviceName` so node bootstrap can find the disk at a fixed path, `/dev/disk/by-id/google-<deviceName>`:
+
+```yaml
+disks:
+  - boot: true
+    sizeGiB: 100
+    category: hyperdisk-balanced
+  - sizeGiB: 3072
+    category: hyperdisk-balanced
+    deviceName: e2b-data   # /dev/disk/by-id/google-e2b-data
+```
+
+- `deviceName` must be a lowercase RFC 1035 name of at most 63 characters, unique across the node class's disks.
+- It is not supported on the boot disk or a secondary boot disk, whose device names the provider sets.
+- The prefixes `persistent-disk-`, `local-ssd-` and `gke-` are reserved, because GCE and GKE assign names that start with them.
+
+A data disk without `deviceName` keeps its existing device name, `gke--disk`.
+
 ## Custom kubelet settings
 
 Configure kubelet behavior on provisioned nodes using `spec.kubeletConfiguration`. These settings apply at boot time and inform Karpenter's scheduler for bin-packing calculations.
@@ -108,7 +128,7 @@ kubeletConfiguration:
 ```
 
 - `maxPods` — absolute cap on pods per node
-- `podsPerCore` — caps pods at `podsPerCore × cpu_cores`; cannot exceed `maxPods`
+- `podsPerCore` — caps pods at `podsPerCore` × the vCPUs the node reports (half the machine type's count with [`threadsPerCore: 1`](#threads-per-core)); cannot exceed `maxPods`
 
 Both values are reflected in `node.status.capacity.pods` and used by the scheduler.
 
@@ -128,6 +148,140 @@ kubeletConfiguration:
 - `clusterDNS` — override cluster DNS server addresses
 - `cpuCFSQuota` — enable or disable CPU CFS quota enforcement for containers with CPU limits
 - `imageGCHighThresholdPercent` / `imageGCLowThresholdPercent` — control when kubelet garbage-collects unused container images
+
+By default, kubelet pulls container images one at a time per node. This serializes every DaemonSet image (CNI, logging, CSI, metrics) on freshly provisioned nodes and adds bootstrap latency. Setting `serializeImagePulls: false` together with `maxParallelImagePulls` parallelizes pulls to reduce that latency, mirroring GKE's [`NodeKubeletConfig.maxParallelImagePulls`](https://cloud.google.com/kubernetes-engine/docs/reference/rest/v1/NodeKubeletConfig).
+
+```yaml
+kubeletConfiguration:
+  serializeImagePulls: false
+  maxParallelImagePulls: 4
+```
+
+- `serializeImagePulls` — controls whether kubelet pulls images one at a time; defaults to `true` (serialized)
+- `maxParallelImagePulls` — maximum number of image pulls kubelet performs in parallel; the minimum is `1` (the kubelet default)
+
+> **Note:** Setting `maxParallelImagePulls` to `2` or greater requires `serializeImagePulls: false`; admission otherwise fails with `maxParallelImagePulls greater than 1 requires serializeImagePulls to be explicitly set to false`. `maxParallelImagePulls: 1` on its own is accepted without any `serializeImagePulls` change, and omitting both fields preserves the default serialized behavior.
+
+### Swap
+
+Create an encrypted boot-disk swap file and let Burstable pods use it:
+
+```yaml
+linuxNodeConfig:
+  swapConfig:
+    enabled: true
+```
+
+Karpenter automatically sizes swap and defaults omitted kubelet settings to `failSwapOn: false` and `memorySwap.swapBehavior: LimitedSwap`. Guaranteed and BestEffort pods do not use swap.
+
+- Set `bootDiskProfile.swapSizeGib` for an explicit size, at most half the boot disk; larger requests are rejected.
+- Set `encryptionConfig.disabled: true` to disable encryption.
+- Set `kubeletConfiguration.memorySwap.swapBehavior: NoSwap` for host-only swap. An explicit `failSwapOn: true` is incompatible with enabled swap.
+- Without a configured boot disk, Karpenter creates a compatible 100 GiB boot disk. An explicitly configured boot disk must set `sizeGiB`.
+- Swap supports Container-Optimized OS and Ubuntu. Bootstrap manifests from GKE `1.34.1-gke.1341000` or newer are a prerequisite; Karpenter does not check their version at launch.
+
+Automatic sizing uses nominal machine memory, truncated to whole GiB, and caps swap at half the boot disk (also rounded down):
+
+```text
+ramGiB = machine memory MiB / 1024
+swapGiB = min(ramGiB + min(ramGiB, 8), bootDiskGiB / 2)
+```
+
+> **Sizing provenance:** This formula was reconstructed from eleven observations of GKE `1.35.8-gke.1796000` defaults in generated bootstrap metadata from zero-node pools—not running-node measurements. It is not a published formula or a guarantee for other releases. The [GKE API reference](https://docs.cloud.google.com/kubernetes-engine/docs/reference/rest/v1/LinuxNodeConfig#BootDiskProfile) says: "If omitted, GKE determines an optimal size based on node memory." The [GKE swap guide](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/node-memory-swap) documents the 50% boot-disk limit.
+
+Swap does not increase schedulable memory. Its space is added to `kubeReserved.ephemeral-storage`, including explicit overrides, unless pods use ephemeral Local SSDs. For example, a `20Gi` reservation plus `4Gi` swap reserves `24Gi`.
+
+Omitted or disabled `swapConfig` creates no swap, and nodes never inherit source-pool swap or zswap settings. To use swap supplied by an image or DaemonSet instead, omit `swapConfig` and configure:
+
+```yaml
+kubeletConfiguration:
+  failSwapOn: false
+  memorySwap:
+    swapBehavior: LimitedSwap
+```
+
+See the [complete example](../../examples/nodeclass/swap-gcenodeclass.yaml) and [GCENodeClass reference](../reference/gcenodeclass.md).
+
+### Graceful node shutdown
+
+Give pods time to terminate when GCE stops or deletes the VM:
+
+```yaml
+kubeletConfiguration:
+  shutdownGracePeriod: 30s
+  shutdownGracePeriodCriticalPods: 15s
+```
+
+- `shutdownGracePeriod` — how long the node delays its shutdown for pods to terminate; setting it turns on graceful node shutdown
+- `shutdownGracePeriodCriticalPods` — the part of `shutdownGracePeriod` reserved for critical pods, which terminate last
+
+Spot nodes default to `30s` total and `15s` for critical pods, matching [GKE Spot defaults](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/spot-vms). On-demand nodes default to `0s` for both fields (graceful node shutdown disabled), matching the upstream kubelet defaults and verified GKE 1.35 on-demand behavior. This is a fixed provider policy, not a guarantee that every GKE version and machine family uses the same defaults.
+
+Source node pool shutdown settings, including priority-based shutdown periods, are never inherited. Values in the GCENodeClass replace the provider defaults. When only `shutdownGracePeriod` is set on Spot, a larger default `shutdownGracePeriodCriticalPods` is lowered to it; on-demand keeps the critical-pods period at `0s` unless explicitly configured. Both fields take a non-negative Go duration such as `30s` or `1m30s`, within Go's supported duration range.
+
+These settings do not extend the underlying VM's shutdown deadline. In particular, increasing a Spot kubelet grace period does not by itself enable GKE's extended Spot termination window. Normal Karpenter node draining is separate from kubelet handling of OS shutdown.
+
+> **Note:** `shutdownGracePeriodCriticalPods` requires `shutdownGracePeriod` and must not exceed it, because the kubelet does not start otherwise.
+
+## Static hugepages
+
+Set `spec.linuxNodeConfig.hugepages` to pre-allocate hugepages on every node that the GCENodeClass provisions. The node allocates the pages at boot, before the kubelet starts, and reports them as `hugepages-2Mi` and `hugepages-1Gi` node capacity.
+
+```yaml
+linuxNodeConfig:
+  hugepages:
+    hugepageSize2m: 4096  # 4096 × 2 MiB = 8 GiB
+    hugepageSize1g: 4     # 4 × 1 GiB = 4 GiB
+```
+
+- `hugepageSize2m` — number of 2 MiB hugepages to allocate
+- `hugepageSize1g` — number of 1 GiB hugepages to allocate
+
+Each field is a page count with a minimum of `1`. Omit a field to allocate no pages of that size. Nodes don't inherit hugepages from the GKE node pool that Karpenter uses as its bootstrap template.
+
+The fields mirror the GKE [pre-allocated hugepages](https://cloud.google.com/kubernetes-engine/docs/how-to/node-system-config#pre-allocated-hugepages) settings, and the GKE limits apply:
+
+- Hugepages can use at most 60% of node memory on machines with less than 30 GB of memory, and at most 80% on larger machines.
+- 1 GiB hugepages are available only on some machine families, such as C3, C3D, C4, and M3.
+
+Karpenter does not validate these limits. Use NodePool requirements, such as `karpenter.k8s.gcp/instance-family` or `karpenter.k8s.gcp/instance-memory`, to limit the NodePool to machine types that can hold the configured pages.
+
+### Advertise hugepages to the scheduler
+
+Karpenter doesn't add the configured hugepages to instance type capacity, so a pending pod that requests hugepages doesn't trigger provisioning on its own. Create a `NodeOverlay` that adds the hugepages capacity to instance types in the NodePool. `NodeOverlay` is an Alpha feature; enable it with `controller.featureGates.nodeOverlay` (see [Settings](../settings.md#feature-gates)).
+
+```yaml
+apiVersion: karpenter.sh/v1alpha1
+kind: NodeOverlay
+metadata:
+  name: hugepages-example
+spec:
+  requirements:
+    - key: karpenter.sh/nodepool
+      operator: In
+      values:
+        - hugepages-example  # NodePool that references the hugepages GCENodeClass
+  capacity:
+    hugepages-2Mi: 8Gi  # hugepageSize2m × 2 MiB
+    hugepages-1Gi: 4Gi  # hugepageSize1g × 1 GiB
+```
+
+Set each capacity value to the total size of the pages in the GCENodeClass, so that the scheduler's view matches what the node allocates.
+
+Pods request hugepages in their resource requests and limits. Kubernetes doesn't overcommit hugepages, so a hugepages request must equal its limit:
+
+```yaml
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+    hugepages-2Mi: 1Gi
+  limits:
+    memory: 128Mi
+    hugepages-2Mi: 1Gi
+```
+
+See [`examples/nodeclass/hugepages-gcenodeclass.yaml`](https://github.com/cloudpilot-ai/karpenter-provider-gcp/blob/main/examples/nodeclass/hugepages-gcenodeclass.yaml) for a complete GCENodeClass and NodeOverlay, and [Manage HugePages](https://kubernetes.io/docs/tasks/manage-hugepages/scheduling-hugepages/) for how pods consume hugepages.
 
 ## Shielded VM
 
@@ -162,6 +316,130 @@ If the chosen machine type does not support the requested confidential type, GCE
 
 The default `ContainerOptimizedOS` and `Ubuntu` images boot as Confidential VMs on supported families without any image change. GPU Confidential VMs are an exception: an A3 instance with an attached H100 GPU using Intel TDX requires a TDX-specific image (for example `cos-tdx-*`), which is not available through the `family` image selectors. Pin such an image by its full resource URL with `imageSelectorTerms[].id`; see the [GCP supported configurations](https://cloud.google.com/confidential-computing/confidential-vm/docs/supported-configurations#supported-images-gpu).
 
+## Minimum CPU platform
+
+`minCpuPlatform` asks GCE to place the node on a given CPU platform or a newer one, for workloads that need an instruction-set level or a performance floor:
+
+This mirrors GKE `NodeConfig.minCpuPlatform` and Terraform node pool `node_config.min_cpu_platform`:
+
+```hcl
+node_config {
+  min_cpu_platform = "Intel Ice Lake"
+}
+```
+
+The equivalent GCENodeClass configuration places the setting directly under `spec`, alongside other node configuration fields such as `gvnic`:
+
+```yaml
+spec:
+  minCpuPlatform: Intel Ice Lake
+```
+
+Leave it unset to let GCE choose. Values are GCE's names, for example `Intel Ice Lake`, `Intel Sapphire Rapids` or `AMD Milan`, and which ones a machine type offers differs by type and zone; see the [GCP CPU platform documentation](https://cloud.google.com/compute/docs/cpu-platforms) for the list. GCE rejects a platform the machine type does not offer, and Karpenter does not model platforms when choosing instance types, so restrict the NodePool to machine types that offer it:
+
+```yaml
+requirements:
+  - key: node.kubernetes.io/instance-type
+    operator: In
+    values: ["n2-standard-16"]
+```
+
+Changing `minCpuPlatform` on an existing GCENodeClass drifts its nodes, which are then replaced.
+
+## Nested virtualization
+
+Nested virtualization lets pods on the node run their own virtual machines, for example with KVM-based sandboxes or emulators.
+
+```yaml
+advancedMachineFeatures:
+  enableNestedVirtualization: true
+```
+
+Nested virtualization is only supported on Intel-based machine families, such as N1, N2, C2, C3 and C4. It is not available on E2, AMD (N2D, C2D, T2D), Arm (T2A, C4A) or Confidential VM instances. See the [GCP nested virtualization documentation](https://cloud.google.com/compute/docs/instances/nested-virtualization/overview) for the current list.
+
+GCE does not reject unsupported machine types: the instance starts normally and the setting is silently ignored. Restrict the NodePool to supported families so nodes that cannot run nested virtual machines are never provisioned:
+
+```yaml
+requirements:
+  - key: karpenter.k8s.gcp/instance-family
+    operator: In
+    values: ["n2", "c3", "c4"]
+```
+
+To confirm nested virtualization is active on a node, check that the `vmx` CPU flag is present (`grep -c vmx /proc/cpuinfo`) or that `/dev/kvm` exists.
+
+## Threads per core
+
+Machine types run two threads per physical core (simultaneous multithreading, SMT). Set `threadsPerCore: 1` to disable SMT, for example for workloads that must not share a core between tenants or that are sensitive to noisy-neighbour effects on a sibling thread:
+
+```yaml
+advancedMachineFeatures:
+  threadsPerCore: 1
+```
+
+With SMT off the guest sees half the machine type's vCPUs: an `n2-standard-16` node reports 8 CPUs. GCE still bills the full 16. Karpenter accounts for this. The instance type's CPU capacity, its kube-reserved CPU, and the [`podsPerCore`](#pod-density) pod cap all use the vCPUs the node reports. Pods are packed against 8, and the NodePool's `limits.cpu` counts 8 for that node. The `karpenter.k8s.gcp/instance-cpu` label keeps the machine type's count (16), since that is the shape being bought. Requests that select a node by that label are unaffected, but a NodePool `limits.cpu` sized from vCPU billing is not: size it from the visible count.
+
+`threadsPerCore` accepts `1` or `2`. It is not supported on every family: GCE rejects C4A, H3, H4D, N4A, T2A, T2D, shared-core types and types with fewer than 2 vCPUs. See the [GCP documentation](https://cloud.google.com/compute/docs/instances/set-threads-per-core) for the current list. Restrict the NodePool to supported families so launches do not fail:
+
+```yaml
+requirements:
+  - key: karpenter.k8s.gcp/instance-family
+    operator: In
+    values: ["n2", "c3", "c4"]
+```
+
+Changing `threadsPerCore` on an existing GCENodeClass drifts its nodes, which are then replaced.
+
+## Local SSDs
+
+[Local SSDs](https://cloud.google.com/compute/docs/disks/local-ssd) give nodes fast scratch storage. Their data is lost when the node stops, is preempted, or is deleted, so use them for caches and temporary data only.
+
+Set `spec.localSsdMode` to choose how workloads see the disks:
+
+- `RawBlock` (default) — unformatted NVMe block devices that your workload formats and mounts.
+- `Ephemeral` — the disks back the kubelet and container runtime storage, and their capacity is reported as the node's `ephemeral-storage`.
+
+```yaml
+localSsdMode: Ephemeral
+```
+
+`localSsdMode` does not set how many disks a node gets. The machine type decides that.
+
+**Fixed-count machine types**, such as `c4d-standard-8-lssd`, `z3-highmem-8-highlssd`, or `z4d-highmem-8-highlssd`, include a set number of local SSDs. Select the machine type and the disks are attached:
+
+```yaml
+nodeSelector:
+  node.kubernetes.io/instance-type: c4d-standard-8-lssd
+```
+
+**Configurable machine types** in the `n1`, `n2`, `n2d`, `c2`, and `c2d` families take a count through the `karpenter.k8s.gcp/instance-local-ssd-count` label. The NodePool must include the label, or Karpenter only launches these machine types without local SSDs:
+
+```yaml
+# NodePool
+requirements:
+  - key: karpenter.k8s.gcp/instance-local-ssd-count
+    operator: Exists
+```
+
+The NodePool and Pod requirements together must then select exactly one count. A Pod usually selects it alongside the machine type:
+
+```yaml
+# Pod
+nodeSelector:
+  node.kubernetes.io/instance-type: n2d-standard-8
+  karpenter.k8s.gcp/instance-local-ssd-count: "4"
+```
+
+If the requirements allow more than one count, Karpenter does not launch the node. The supported counts depend on the machine family and vCPU count; see the GCE [general-purpose](https://cloud.google.com/compute/docs/general-purpose-machines) and [compute-optimized](https://cloud.google.com/compute/docs/compute-optimized-machines) machine family pages.
+
+In `Ephemeral` mode, Karpenter checks a Pod's `ephemeral-storage` request against the capacity of the selected disks. Most machine types provide 375 GiB per disk. Z3 virtual machines provide 3,000 GiB, the Z3 bare-metal type `z3-highmem-192-highlssd-metal` provides 6,000 GiB, and Z4D provides 3,500 GiB. The request does not choose the count. In `RawBlock` mode, `ephemeral-storage` reflects only the boot disk.
+
+Z4D supports only Hyperdisk. If you set a boot disk `category`, choose a Hyperdisk type such as `hyperdisk-balanced`.
+
+Karpenter sets `scheduling.onHostMaintenance` to `MIGRATE` for on-demand Z3 and Z4D virtual machine (non-bare-metal) nodes, so they live-migrate during host maintenance. Compute Engine cannot live-migrate Z3 shapes with more than 18 TiB of bundled local SSD or Z4D shapes with more than 42,000 GiB. Karpenter sets `TERMINATE` for those shapes and for Spot nodes.
+
+If you are upgrading from a version that accepted `spec.disks[].category: local-ssd`, see [`MIGRATION.md`](https://github.com/cloudpilot-ai/karpenter-provider-gcp/blob/main/MIGRATION.md).
+
 ## Disk type scheduling
 
 Karpenter applies `disk-type.gke.io/*` labels to provisioned nodes based on the instance type's machine family. These labels indicate which persistent disk types the instance supports, enabling two capabilities:
@@ -192,6 +470,41 @@ spec:
 ```
 
 This NodePool provisions only instance types from families that support Hyperdisk Balanced (such as n2, n4, c3, c4). Instance types from families without Hyperdisk Balanced support (such as e2, n1) are excluded.
+
+### Default disk selection
+
+Omit `category` from `spec.disks[]` unless the workload requires a specific disk type:
+
+```yaml
+disks:
+  - sizeGiB: 60
+    boot: true
+```
+
+Karpenter leaves the disk type unset, and Compute Engine applies the default for the machine family that is provisioned. This lets one GCENodeClass and NodePool span families that use different disk technologies, widening capacity options without requiring separate resources per family. Compute Engine documents these representative defaults:
+
+- **N2, N2D** — `pd-standard`
+- **C3, C3D** — `pd-balanced`
+- **N4, N4D** — `hyperdisk-balanced`
+
+See the Compute Engine API documentation for [`disks[].initializeParams.diskType`](https://cloud.google.com/compute/docs/reference/rest/v1/instances/insert) for the complete default mapping. These defaults belong to Compute Engine, not Karpenter.
+
+> **Note:** Nodes in one NodePool can receive different disk types with different performance and cost characteristics. Pin `category` when a workload requires predictable disk characteristics.
+
+### Pinning a disk type
+
+Set `category` when the workload requires a specific compatible disk type:
+
+```yaml
+disks:
+  - category: pd-balanced
+    sizeGiB: 60
+    boot: true
+```
+
+An explicit category makes disk performance and cost more predictable, but it is only compatible with machine families that support that disk type. Disks that set `provisionedIOPS` or `provisionedThroughput` require an explicit compatible `category`.
+
+The NodePool `disk-type.gke.io/*` requirements described above constrain which instance types Karpenter selects; they do not select the boot disk type. Combine them with an explicit `category` to keep machine selection compatible with the fixed disk type. For the full `disks[]` field specification, see the [GCENodeClass reference](../reference/gcenodeclass.md).
 
 ### Available disk-type labels
 
@@ -228,6 +541,101 @@ parameters:
 ```
 
 StorageClasses with `use-allowed-disk-topology: "true"` can use disk-type labels in `allowedTopologies`, and bound PVs can carry these labels in node affinity so replacement pods schedule only on nodes that support the disk type.
+
+## Workload-side provider label selection
+
+Provider well-known labels can be used both in NodePool `requirements` and in pod `nodeSelector` / node affinity. Karpenter includes pod-level requirements when choosing which instance type to launch.
+
+Common GCP instance labels:
+
+| Label                                   | Source            | Notes                                                                              |
+|-----------------------------------------|-------------------|------------------------------------------------------------------------------------|
+| `karpenter.k8s.gcp/instance-family`     | Machine type name | Recommended for selecting GCP machine families, for example `c2`, `c2d`, or `n2`.  |
+| `karpenter.k8s.gcp/instance-cpu`        | Compute API       | vCPU count.                                                                        |
+| `karpenter.k8s.gcp/instance-memory`     | Compute API       | Memory in MiB.                                                                     |
+| `karpenter.k8s.gcp/instance-generation` | Machine type name | Parsed from standard machine family names; prefer `instance-family` when possible. |
+| `karpenter.k8s.gcp/instance-shape`      | Machine type name | Parsed from standard machine type names, for example `standard` or `highmem`.      |
+| `karpenter.k8s.gcp/instance-size`       | Machine type name | Parsed from standard machine type names.                                           |
+| `karpenter.k8s.gcp/instance-bare-metal` | Machine type name | `"true"` for names ending in `-metal`, otherwise `"false"`.                        |
+
+### Bare-metal selection
+
+To require VMs, add this requirement to a NodePool's `spec.template.spec.requirements`:
+
+```yaml
+- key: karpenter.k8s.gcp/instance-bare-metal
+  operator: In
+  values: ["false"]
+```
+
+To require bare metal instead:
+
+```yaml
+- key: karpenter.k8s.gcp/instance-bare-metal
+  operator: In
+  values: ["true"]
+```
+
+The label follows the Compute Engine `-metal` naming convention, including bundled-SSD names such as `c4-standard-288-lssd-metal`. No bare-metal API field is available. The label does not change default instance selection or guarantee compatibility with a NodeClass's configuration.
+
+Pods can select VMs with `nodeSelector`:
+
+```yaml
+spec:
+  nodeSelector:
+    karpenter.k8s.gcp/instance-bare-metal: "false"
+```
+
+Use `"true"` to select bare metal. A NodePool requirement constrains only that pool. To prohibit metal for a workload across pools, constrain the pod or every eligible pool.
+
+#### Adopting the label on existing nodes
+
+No configuration changes are required when upgrading. This label does not change instance selection or cause drift unless you add requirements that use it.
+
+The following caveats apply only when adopting the new label on an existing pool. Existing Nodes and NodeClaims do not receive this label automatically. `In ["false"]` rejects unlabeled legacy nodes, including VMs. Adding it to a NodePool marks those NodeClaims as drifted, subject to disruption controls. Pods that explicitly select this label cannot use unlabeled existing Nodes. Karpenter may provision a new matching node even when those existing Nodes have spare capacity.
+
+### Machine-family selection
+
+For example, use `nodeAffinity` when a workload can run on any of several machine families:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: compute-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: compute-worker
+  template:
+    metadata:
+      labels:
+        app: compute-worker
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: karpenter.k8s.gcp/instance-family
+                    operator: In
+                    values: ["c2", "c2d"]
+      containers:
+        - name: compute-worker
+          image: public.ecr.aws/eks-distro/kubernetes/pause:3.2
+          resources:
+            requests:
+              cpu: "1"
+              memory: 1Gi
+```
+
+A `nodeSelector` can only match one exact value:
+
+```yaml
+nodeSelector:
+  karpenter.k8s.gcp/instance-family: c2
+```
 
 ## Multiple NodePools
 

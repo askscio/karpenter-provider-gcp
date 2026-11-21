@@ -28,6 +28,11 @@ import (
 
 // GCENodeClassSpec is the top level specification for the GCP Karpenter Provider.
 // This will contain the configuration necessary to launch instances in GCP.
+// +kubebuilder:validation:XValidation:message="subnetRangeName and subnetRangeNames are mutually exclusive",rule="!(has(self.subnetRangeName) && has(self.subnetRangeNames))"
+// +kubebuilder:validation:XValidation:message="linuxNodeConfig.swapConfig.enabled conflicts with kubeletConfiguration.failSwapOn true: the kubelet does not start while swap is active",rule="!has(self.linuxNodeConfig) || !has(self.linuxNodeConfig.swapConfig) || !has(self.linuxNodeConfig.swapConfig.enabled) || !self.linuxNodeConfig.swapConfig.enabled || !has(self.kubeletConfiguration) || !has(self.kubeletConfiguration.failSwapOn) || !self.kubeletConfiguration.failSwapOn"
+// +kubebuilder:validation:XValidation:message="memorySwap.swapBehavior LimitedSwap requires kubeletConfiguration.failSwapOn to be explicitly set to false unless linuxNodeConfig.swapConfig is enabled",rule="!has(self.kubeletConfiguration) || !has(self.kubeletConfiguration.memorySwap) || !has(self.kubeletConfiguration.memorySwap.swapBehavior) || self.kubeletConfiguration.memorySwap.swapBehavior != 'LimitedSwap' || (has(self.linuxNodeConfig) && has(self.linuxNodeConfig.swapConfig) && has(self.linuxNodeConfig.swapConfig.enabled) && self.linuxNodeConfig.swapConfig.enabled) || (has(self.kubeletConfiguration.failSwapOn) && self.kubeletConfiguration.failSwapOn == false)"
+// +kubebuilder:validation:XValidation:message="linuxNodeConfig.swapConfig.bootDiskProfile.swapSizeGib must be at most half of the boot disk sizeGiB",rule="!has(self.linuxNodeConfig) || !has(self.linuxNodeConfig.swapConfig) || !has(self.linuxNodeConfig.swapConfig.bootDiskProfile) || !has(self.linuxNodeConfig.swapConfig.bootDiskProfile.swapSizeGib) || !has(self.disks) || self.disks.all(d, !has(d.boot) || !d.boot || !has(d.sizeGiB) || 2 * self.linuxNodeConfig.swapConfig.bootDiskProfile.swapSizeGib <= d.sizeGiB)"
+// +kubebuilder:validation:XValidation:message="linuxNodeConfig.swapConfig.bootDiskProfile.swapSizeGib must be at most 50GiB when the provider creates the default 100GiB boot disk",rule="!has(self.linuxNodeConfig) || !has(self.linuxNodeConfig.swapConfig) || !has(self.linuxNodeConfig.swapConfig.bootDiskProfile) || !has(self.linuxNodeConfig.swapConfig.bootDiskProfile.swapSizeGib) || (has(self.disks) && self.disks.exists(d, has(d.boot) && d.boot)) || self.linuxNodeConfig.swapConfig.bootDiskProfile.swapSizeGib <= 50"
 type GCENodeClassSpec struct {
 	// ServiceAccount is the GCP IAM service account email to assign to the instance
 	// +kubebuilder:validation:Pattern=`^[^@]+@(developer\.gserviceaccount\.com|[^@]+\.iam\.gserviceaccount\.com)$`
@@ -35,6 +40,7 @@ type GCENodeClassSpec struct {
 	ServiceAccount string `json:"serviceAccount,omitempty"`
 	// Disk defines the disks to attach to the provisioned instance.
 	// +kubebuilder:validation:MaxItems=10
+	// +kubebuilder:validation:XValidation:message="deviceName must be unique across disks",rule="self.all(d, !has(d.deviceName) || self.filter(e, has(e.deviceName) && e.deviceName == d.deviceName).size() == 1)"
 	// +optional
 	Disks []Disk `json:"disks,omitempty"`
 	// ImageSelectorTerms is a list of or image selector terms. The terms are ORed.
@@ -50,14 +56,30 @@ type GCENodeClassSpec struct {
 	// +optional
 	ImageFamily *string `json:"imageFamily,omitempty"`
 	// SubnetRangeName is the name of the subnetwork secondary IPv4 range from which
-	// to allocate pod IP addresses (alias IPs for pods). If not specified, the cluster's
-	// default pod secondary range (ClusterSecondaryRangeName from the cluster's IP
-	// allocation policy) is used.
+	// to allocate pod IP addresses (alias IPs for pods). When set, only this range is
+	// considered. Mutually exclusive with subnetRangeNames. If neither field is set,
+	// the cluster's default and additional pod ranges on its primary subnetwork are used.
+	//
+	// Deprecated: use SubnetRangeNames with a single entry instead.
 	// +kubebuilder:validation:MinLength=1
 	// +kubebuilder:validation:MaxLength=63
 	// +kubebuilder:validation:Pattern=`^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$`
 	// +optional
 	SubnetRangeName *string `json:"subnetRangeName,omitempty"`
+	// SubnetRangeNames is a list of subnetwork secondary IPv4 range names from which
+	// to allocate pod IP addresses (alias IPs for pods). When more than one name is
+	// listed, the provider prefers the range with the most Compute-reported free IPv4 addresses
+	// at launch. Mutually exclusive with subnetRangeName. When set, this list replaces
+	// the cluster defaults completely. If neither field is set, the cluster's default
+	// and additional pod ranges on its primary subnetwork are used.
+	// +kubebuilder:validation:MinItems=1
+	// +kubebuilder:validation:MaxItems=16
+	// +kubebuilder:validation:XValidation:message="subnetRangeNames must be unique",rule="self.all(x, self.exists_one(y, x == y))"
+	// +kubebuilder:validation:items:MinLength=1
+	// +kubebuilder:validation:items:MaxLength=63
+	// +kubebuilder:validation:items:Pattern=`^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$`
+	// +optional
+	SubnetRangeNames []string `json:"subnetRangeNames,omitempty"`
 	// KubeletConfiguration defines args to be used when configuring kubelet on provisioned nodes.
 	// They are a vswitch of the upstream types, recognizing not all options may be supported.
 	// Wherever possible, the types and names should reflect the upstream kubelet types.
@@ -66,7 +88,12 @@ type GCENodeClassSpec struct {
 	// +kubebuilder:validation:XValidation:message="evictionSoftGracePeriod OwnerKey does not have a matching evictionSoft",rule="has(self.evictionSoftGracePeriod) ? self.evictionSoftGracePeriod.all(e, (e in self.evictionSoft)):true"
 	// +optional
 	KubeletConfiguration *KubeletConfiguration `json:"kubeletConfiguration,omitempty"`
-	// Labels to be applied on GCE VM instance.
+	// LinuxNodeConfig configures the Linux kernel of provisioned nodes.
+	// Mirrors GKE node pool linux_node_config.
+	// +optional
+	LinuxNodeConfig *LinuxNodeConfig `json:"linuxNodeConfig,omitempty"`
+	// Labels to be applied on the GCE VM instance and its persistent disks.
+	// Local SSD scratch disks do not support labels.
 	// +kubebuilder:validation:MaxProperties=20
 	// +kubebuilder:validation:XValidation:message="empty tag keys aren't supported",rule="self.all(k, k != '')"
 	// +kubebuilder:validation:XValidation:message="tag contains a restricted tag matching gce:gce-cluster-name",rule="self.all(k, k !='gce:gce-cluster-name')"
@@ -85,10 +112,36 @@ type GCENodeClassSpec struct {
 	// +kubebuilder:validation:MaxItems=20
 	// +optional
 	NetworkTags []NetworkTag `json:"networkTags,omitempty"`
+	// ResourceManagerTags are GCP resource manager (secure) tags bound to the instance
+	// at creation. Unlike network tags, binding them is IAM-controlled, so they can be
+	// used as targets in network firewall policies, IAM conditions and organization policies.
+	// Keys are `tagKeys/{tag_key_id}` or `{org_id|project_id}/{tag_key_short_name}`; values are
+	// `tagValues/{tag_value_id}` or `{tag_value_short_name}`. Mirrors GKE node pool
+	// resource_manager_tags. The Karpenter service account needs roles/resourcemanager.tagUser
+	// on the tag values.
+	// +kubebuilder:validation:MaxProperties=50
+	// +kubebuilder:validation:XValidation:message="invalid resourceManagerTags key",rule="self.all(k, k.matches('^tagKeys/[0-9]+$') || (!k.startsWith('tagKeys/') && k.matches('^[^/]+/[^/]+$')))"
+	// +optional
+	ResourceManagerTags map[string]ResourceManagerTagValue `json:"resourceManagerTags,omitempty"`
 	// ShieldedInstanceConfig enables Shielded VM for provisioned nodes: Secure Boot,
 	// virtual TPM, and integrity monitoring.
 	// +optional
 	ShieldedInstanceConfig *ShieldedInstanceConfig `json:"shieldedInstanceConfig,omitempty"`
+	// MinCpuPlatform is the minimum CPU platform for provisioned nodes, for example
+	// "Intel Ice Lake" or "Intel Granite Rapids". GCE schedules the node on that platform or
+	// a newer one. Leave unset to let GCE choose. GCE rejects a platform the machine type does
+	// not offer, so restrict the NodePool to machine types that do.
+	// Mirrors GKE NodeConfig.minCpuPlatform (Terraform node_config.min_cpu_platform).
+	// +optional
+	MinCpuPlatform string `json:"minCpuPlatform,omitempty"`
+	// GVNIC configures Google Virtual NIC on every network interface of provisioned nodes.
+	// When unset, GCE chooses the interface type. Mirrors GKE NodeConfig.gvnic
+	// (Terraform node_config.gvnic).
+	// +optional
+	GVNIC *VirtualNIC `json:"gvnic,omitempty"`
+	// AdvancedMachineFeatures configures advanced CPU and virtualisation options for provisioned nodes.
+	// +optional
+	AdvancedMachineFeatures *AdvancedMachineFeatures `json:"advancedMachineFeatures,omitempty"`
 	// ConfidentialInstanceType enables Confidential VM for provisioned nodes using the
 	// named technology (AMD SEV / SEV-SNP or Intel TDX), providing in-use memory
 	// encryption. Leave unset to disable. Only supported on specific machine families.
@@ -112,6 +165,69 @@ type GCENodeClassSpec struct {
 	// +kubebuilder:default=default
 	// +optional
 	GPUDriverVersion string `json:"gpuDriverVersion,omitempty"`
+	// GPUSharingConfig lets multiple containers share each physical GPU.
+	// Mirrors the GKE node pool guest_accelerator.gpu_sharing_config field.
+	// Ignored for non-GPU instance types.
+	// +optional
+	GPUSharingConfig *GPUSharingConfig `json:"gpuSharingConfig,omitempty"`
+	// LocalSsdMode exposes local SSDs as raw devices or kubelet ephemeral storage.
+	// +kubebuilder:default=RawBlock
+	// +optional
+	LocalSsdMode LocalSSDMode `json:"localSsdMode,omitempty"`
+	// PreemptionNoticeDuration is how long before shutdown GCE flips the
+	// instance/preempted metadata key on a Spot VM. Unset (the default) gives no advance
+	// notice: the key flips at the same moment the ACPI G2 Soft Off signal is sent.
+	// "120s" gives a two-minute warning, letting Karpenter start draining before shutdown.
+	// GCE currently accepts up to two minutes.
+	// Only applies to Spot capacity; ignored for on-demand nodes.
+	// Reading the notice requires an agent on the node that watches the metadata key
+	// and sets the GCESpotPreempting condition — see docs/spot-preemption.md.
+	// +kubebuilder:validation:Type=string
+	// +kubebuilder:validation:Pattern=`^([0-9]+(s|m|h))+$`
+	// +kubebuilder:validation:XValidation:message="preemptionNoticeDuration must not exceed 120s",rule="duration(self) <= duration('120s')"
+	// +optional
+	PreemptionNoticeDuration *metav1.Duration `json:"preemptionNoticeDuration,omitempty"`
+}
+
+// LocalSSDMode controls how local SSDs are exposed to workloads.
+// +kubebuilder:validation:Enum=RawBlock;Ephemeral
+type LocalSSDMode string
+
+const (
+	// LocalSSDModeRawBlock leaves local SSDs unformatted.
+	LocalSSDModeRawBlock LocalSSDMode = "RawBlock"
+	// LocalSSDModeEphemeral uses local SSDs for kubelet ephemeral storage.
+	LocalSSDModeEphemeral LocalSSDMode = "Ephemeral"
+)
+
+// GPUSharingStrategy selects how containers share a physical GPU.
+// +kubebuilder:validation:Enum=TimeSharing
+type GPUSharingStrategy string
+
+const (
+	// GPUSharingStrategyTimeSharing time-slices each GPU between containers.
+	GPUSharingStrategyTimeSharing GPUSharingStrategy = "TimeSharing"
+)
+
+// GPUSharingConfig configures GPU sharing on GPU nodes.
+type GPUSharingConfig struct {
+	// Strategy is the GPU sharing strategy.
+	// +required
+	Strategy GPUSharingStrategy `json:"strategy"`
+	// MaxSharedClientsPerGPU is the number of containers that can share one
+	// physical GPU. The node advertises this many nvidia.com/gpu per GPU.
+	// +kubebuilder:validation:Minimum=2
+	// +kubebuilder:validation:Maximum=48
+	// +required
+	MaxSharedClientsPerGPU int32 `json:"maxSharedClientsPerGPU"`
+}
+
+// VirtualNIC configures the Google Virtual NIC (gVNIC) feature, matching GKE VirtualNIC.
+type VirtualNIC struct {
+	// Enabled selects GVNIC when true and VIRTIO_NET when false on every interface.
+	// GCE rejects a type unsupported by the machine series or node image.
+	// +required
+	Enabled bool `json:"enabled"`
 }
 
 // NetworkConfig holds network settings for provisioned nodes.
@@ -157,8 +273,8 @@ type AdditionalNetworkInterface struct {
 // +kubebuilder:validation:XValidation:message="channel is only supported for family ContainerOptimizedOS",rule="!has(self.channel) || self.family == 'ContainerOptimizedOS'"
 // +kubebuilder:validation:XValidation:message="exactly one of alias, id, or family must be set",rule="(has(self.alias) ? 1 : 0) + (has(self.id) ? 1 : 0) + (has(self.family) ? 1 : 0) == 1"
 // +kubebuilder:validation:XValidation:message="ContainerOptimizedOS version must be 'latest' or 'milestone.build.build.build' (e.g. '125.19216.104.126')",rule="!has(self.version) || !has(self.family) || self.family != 'ContainerOptimizedOS' || self.version == 'latest' || self.version.matches('^[0-9]+[.][0-9]+[.][0-9]+[.][0-9]+$')"
-// +kubebuilder:validation:XValidation:message="Ubuntu2404 version must be 'latest' or 'vYYYYMMDD' (e.g. 'v20260416')",rule="!has(self.version) || !has(self.family) || self.family != 'Ubuntu2404' || self.version == 'latest' || self.version.matches('^v[0-9]{8}$')"
-// +kubebuilder:validation:XValidation:message="Ubuntu2204 version must be 'latest' or 'vYYYYMMDD' (e.g. 'v20260416')",rule="!has(self.version) || !has(self.family) || self.family != 'Ubuntu2204' || self.version == 'latest' || self.version.matches('^v[0-9]{8}$')"
+// +kubebuilder:validation:XValidation:message="Ubuntu2404 version must be 'latest' or 'vYYYYMMDD' with an optional release letter (e.g. 'v20260416', 'v20251218a')",rule="!has(self.version) || !has(self.family) || self.family != 'Ubuntu2404' || self.version == 'latest' || self.version.matches('^v[0-9]{8}[a-z]?$')"
+// +kubebuilder:validation:XValidation:message="Ubuntu2204 version must be 'latest' or 'vYYYYMMDD' with an optional release letter (e.g. 'v20260416', 'v20251218a')",rule="!has(self.version) || !has(self.family) || self.family != 'Ubuntu2204' || self.version == 'latest' || self.version.matches('^v[0-9]{8}[a-z]?$')"
 // +kubebuilder:validation:XValidation:message="family 'Ubuntu' is not valid; use Ubuntu2404 for Ubuntu 24.04 or Ubuntu2204 for Ubuntu 22.04",rule="!has(self.family) || self.family != 'Ubuntu'"
 type ImageSelectorTerm struct {
 	// Deprecated: use Family with Channel or Version instead.
@@ -167,7 +283,7 @@ type ImageSelectorTerm struct {
 	// +kubebuilder:validation:XValidation:message="'alias' is improperly formatted, must match the format 'family@version'",rule="self.matches('^[a-zA-Z0-9]+@.+$')"
 	// +kubebuilder:validation:XValidation:message="family is not supported, must be one of the following: 'ContainerOptimizedOS,Ubuntu'",rule="self.find('^[^@]+') in ['ContainerOptimizedOS', 'Ubuntu']"
 	// +kubebuilder:validation:XValidation:message="ContainerOptimizedOS version must be 'latest' or 'milestone.build.build.build' (e.g. '125.19216.104.126')",rule="!self.startsWith('ContainerOptimizedOS@') || self.matches('^ContainerOptimizedOS@(latest|[0-9]+[.][0-9]+[.][0-9]+[.][0-9]+)$')"
-	// +kubebuilder:validation:XValidation:message="Ubuntu version must be 'latest' or 'vYYYYMMDD' (e.g. 'v20260416')",rule="!self.startsWith('Ubuntu@') || self.matches('^Ubuntu@(latest|v[0-9]{8})$')"
+	// +kubebuilder:validation:XValidation:message="Ubuntu version must be 'latest' or 'vYYYYMMDD' with an optional release letter (e.g. 'v20260416', 'v20251218a')",rule="!self.startsWith('Ubuntu@') || self.matches('^Ubuntu@(latest|v[0-9]{8}[a-z]?)$')"
 	// +kubebuilder:validation:MaxLength=60
 	// +optional
 	Alias string `json:"alias,omitempty"`
@@ -188,7 +304,7 @@ type ImageSelectorTerm struct {
 	Channel string `json:"channel,omitempty"`
 	// Version pins the image to a specific version or "latest".
 	// For ContainerOptimizedOS: "latest" or "milestone.build.build.build" (e.g. "125.19216.104.126").
-	// For Ubuntu2404/Ubuntu2204: "latest" or "vYYYYMMDD" (e.g. "v20260416").
+	// For Ubuntu2404/Ubuntu2204: "latest" or "vYYYYMMDD" with an optional release letter (e.g. "v20260416", "v20251218a").
 	// +kubebuilder:validation:MaxLength=32
 	// +optional
 	Version string `json:"version,omitempty"`
@@ -217,6 +333,8 @@ type KubeletQuantity string
 // Wherever possible, the types and names should reflect the upstream kubelet types.
 // https://pkg.go.dev/k8s.io/kubelet/config/v1beta1#KubeletConfiguration
 // https://github.com/kubernetes/kubernetes/blob/9f82d81e55cafdedab619ea25cabf5d42736dacf/cmd/kubelet/app/options/options.go#L53
+// +kubebuilder:validation:XValidation:message="maxParallelImagePulls greater than 1 requires serializeImagePulls to be explicitly set to false",rule="!has(self.maxParallelImagePulls) || self.maxParallelImagePulls < 2 || (has(self.serializeImagePulls) && self.serializeImagePulls == false)"
+// +kubebuilder:validation:XValidation:message="shutdownGracePeriodCriticalPods requires shutdownGracePeriod and must not exceed it",rule="!has(self.shutdownGracePeriodCriticalPods) || (has(self.shutdownGracePeriod) && duration(self.shutdownGracePeriodCriticalPods) <= duration(self.shutdownGracePeriod))"
 type KubeletConfiguration struct {
 	// clusterDNS is a list of IP addresses for the cluster DNS server.
 	// Note that not all providers may use all addresses.
@@ -288,11 +406,66 @@ type KubeletConfiguration struct {
 	// CPUCFSQuota enables CPU CFS quota enforcement for containers that specify CPU limits.
 	// +optional
 	CPUCFSQuota *bool `json:"cpuCFSQuota,omitempty"`
+	// SerializeImagePulls, when enabled, tells the kubelet to pull images one at a
+	// time. Must be explicitly set to false to set MaxParallelImagePulls above 1.
+	// Default: true
+	// +optional
+	SerializeImagePulls *bool `json:"serializeImagePulls,omitempty"`
+	// MaxParallelImagePulls sets the maximum number of image pulls in parallel.
+	// Values above 1 require SerializeImagePulls to be explicitly set to false.
+	// Nodes with many DaemonSets pulling cold images concurrently (a common case
+	// right after a fresh node joins the cluster) benefit most from raising this
+	// above the kubelet default of 1.
+	// +kubebuilder:validation:Minimum:=1
+	// +optional
+	MaxParallelImagePulls *int32 `json:"maxParallelImagePulls,omitempty"`
+	// FailSwapOn tells the kubelet to fail to start if swap is enabled on the node.
+	// Must be explicitly set to false for memorySwap.swapBehavior LimitedSwap, unless
+	// linuxNodeConfig.swapConfig creates the swap file: the provider then defaults it
+	// to false for the node.
+	// Default: true
+	// +optional
+	FailSwapOn *bool `json:"failSwapOn,omitempty"`
+	// MemorySwap configures swap memory available to container workloads. Swap that
+	// the provider creates is requested separately through linuxNodeConfig.swapConfig;
+	// without it, providing a swap device or file is up to the node image or a DaemonSet.
+	// +optional
+	MemorySwap *MemorySwapConfiguration `json:"memorySwap,omitempty"`
+	// ShutdownGracePeriod is how long the node delays its shutdown so that pods
+	// can terminate, for example when GCE stops or deletes the VM. It turns on
+	// graceful node shutdown. Spot nodes default to 30s; on-demand nodes default
+	// to 0s. Source node pool shutdown settings are not inherited.
+	// +kubebuilder:validation:Type=string
+	// +kubebuilder:validation:Pattern=`^([0-9]+(\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$`
+	// +optional
+	// +kubebuilder:validation:XValidation:rule="duration(self) >= duration('0s')",message="must be a non-negative duration within Go's supported range"
+	ShutdownGracePeriod *metav1.Duration `json:"shutdownGracePeriod,omitempty"`
+	// ShutdownGracePeriodCriticalPods is the part of shutdownGracePeriod
+	// reserved for critical pods, which terminate after all other pods.
+	// Spot nodes default to 15s; on-demand nodes default to 0s. When only
+	// shutdownGracePeriod is set, a larger Spot default is lowered to it.
+	// +kubebuilder:validation:Type=string
+	// +kubebuilder:validation:Pattern=`^([0-9]+(\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$`
+	// +optional
+	// +kubebuilder:validation:XValidation:rule="duration(self) >= duration('0s')",message="must be a non-negative duration within Go's supported range"
+	ShutdownGracePeriodCriticalPods *metav1.Duration `json:"shutdownGracePeriodCriticalPods,omitempty"`
+}
+
+// MemorySwapConfiguration configures swap memory available to container workloads.
+// https://pkg.go.dev/k8s.io/kubelet/config/v1beta1#MemorySwapConfiguration
+type MemorySwapConfiguration struct {
+	// SwapBehavior is NoSwap (workloads cannot use swap, the kubelet default) or
+	// LimitedSwap (a container's swap limit is proportionate to its memory request,
+	// for Burstable pods only).
+	// +kubebuilder:validation:Enum:={NoSwap,LimitedSwap}
+	// +optional
+	SwapBehavior string `json:"swapBehavior,omitempty"`
 }
 
 // +kubebuilder:validation:XValidation:message="provisionedIOPS is only applicable for pd-extreme, hyperdisk-balanced, hyperdisk-balanced-high-availability, and hyperdisk-extreme",rule="!has(self.provisionedIOPS) || self.category in ['pd-extreme', 'hyperdisk-balanced', 'hyperdisk-balanced-high-availability', 'hyperdisk-extreme']"
 // +kubebuilder:validation:XValidation:message="provisionedThroughput is only applicable for hyperdisk-balanced, hyperdisk-balanced-high-availability, hyperdisk-throughput, and hyperdisk-ml",rule="!has(self.provisionedThroughput) || self.category in ['hyperdisk-balanced', 'hyperdisk-balanced-high-availability', 'hyperdisk-throughput', 'hyperdisk-ml']"
 // +kubebuilder:validation:XValidation:message="provisionedIOPS and provisionedThroughput must both be set or both be unset for hyperdisk-balanced and hyperdisk-balanced-high-availability",rule="!(self.category in ['hyperdisk-balanced', 'hyperdisk-balanced-high-availability']) || (has(self.provisionedIOPS) == has(self.provisionedThroughput))"
+// +kubebuilder:validation:XValidation:message="deviceName is only supported on a data disk, not the boot disk or a secondary boot disk",rule="!has(self.deviceName) || (!(has(self.boot) && self.boot) && !has(self.secondaryBootImage))"
 type Disk struct {
 	// SizeGiB is the size of the disk. Unit: GiB
 	// +kubebuilder:validation:XValidation:message="size invalid",rule="self >= 10"
@@ -307,6 +480,17 @@ type Disk struct {
 	// SecondaryBootImage is the secondary boot disk image name (e.g. global/images/DISK_IMAGE_NAME).
 	// +optional
 	SecondaryBootImage string `json:"secondaryBootImage,omitempty"`
+	// DeviceName is the device name of a data disk: the guest sees the disk as
+	// /dev/disk/by-id/google-<deviceName>, so node bootstrap can find it by a
+	// fixed path. Not supported on the boot disk or a secondary boot disk,
+	// whose device names the provider sets. Prefixes that GCE or GKE assign
+	// themselves are reserved.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z]([-a-z0-9]*[a-z0-9])?$`
+	// +kubebuilder:validation:XValidation:message="deviceName must not start with persistent-disk-, local-ssd- or gke-, which GCE and GKE assign",rule="!self.startsWith('persistent-disk-') && !self.startsWith('local-ssd-') && !self.startsWith('gke-')"
+	// +optional
+	DeviceName string `json:"deviceName,omitempty"`
 	// SecondaryBootMode is the secondary boot disk mode (e.g. CONTAINER_IMAGE_CACHE).
 	// +optional
 	SecondaryBootMode SecondaryBootDiskMode `json:"secondaryBootMode,omitempty"`
@@ -334,7 +518,7 @@ type Disk struct {
 }
 
 // DiskCategory represents a disk category type
-// +kubebuilder:validation:Enum=hyperdisk-balanced;hyperdisk-balanced-high-availability;hyperdisk-extreme;hyperdisk-ml;hyperdisk-throughput;local-ssd;pd-balanced;pd-extreme;pd-ssd;pd-standard
+// +kubebuilder:validation:Enum=hyperdisk-balanced;hyperdisk-balanced-high-availability;hyperdisk-extreme;hyperdisk-ml;hyperdisk-throughput;pd-balanced;pd-extreme;pd-ssd;pd-standard
 type DiskCategory string
 
 // SecondaryBootDiskMode is the mode of the secondary boot disk.
@@ -349,6 +533,13 @@ type SecondaryBootDiskMode string
 // +kubebuilder:validation:MaxLength=63
 type NetworkTag string
 
+// ResourceManagerTagValue is a resource manager tag value, either `tagValues/{tag_value_id}`
+// or a `{tag_value_short_name}` under a namespaced key.
+// +kubebuilder:validation:Pattern=`^(tagValues/[0-9]+|[^/]+)$`
+// +kubebuilder:validation:MinLength=1
+// +kubebuilder:validation:MaxLength=63
+type ResourceManagerTagValue string
+
 // ShieldedInstanceConfig defines the Shielded VM options for a GCE instance.
 type ShieldedInstanceConfig struct {
 	// EnableSecureBoot defines whether the instance has Secure Boot enabled.
@@ -360,6 +551,86 @@ type ShieldedInstanceConfig struct {
 	// EnableIntegrityMonitoring defines whether the instance has integrity monitoring enabled.
 	// +optional
 	EnableIntegrityMonitoring *bool `json:"enableIntegrityMonitoring,omitempty"`
+}
+
+// LinuxNodeConfig defines the Linux kernel options for a provisioned node.
+type LinuxNodeConfig struct {
+	// Hugepages configures the static hugepages that the node allocates at boot.
+	// Mirrors GKE node pool linux_node_config.hugepages_config.
+	// +optional
+	Hugepages *HugepagesConfig `json:"hugepages,omitempty"`
+	// SwapConfig configures the swap file that the node creates at boot, before
+	// the kubelet starts. Mirrors GKE node pool linux_node_config.swap_config.
+	// +optional
+	SwapConfig *SwapConfig `json:"swapConfig,omitempty"`
+}
+
+// HugepagesConfig defines the static hugepages that a node allocates at boot.
+// Karpenter does not add the hugepages to the instance type capacity. Use a
+// NodeOverlay to advertise the hugepages capacity to the scheduling simulation.
+type HugepagesConfig struct {
+	// HugepageSize2m is the number of 2 MiB hugepages to allocate.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	HugepageSize2m *int32 `json:"hugepageSize2m,omitempty"`
+	// HugepageSize1g is the number of 1 GiB hugepages to allocate.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	HugepageSize1g *int32 `json:"hugepageSize1g,omitempty"`
+}
+
+// SwapConfig defines the swap file that a node creates at boot.
+// The GKE node bootstrap creates the file before the kubelet starts, so the
+// kubelet finds the swap already active at its first start.
+// +kubebuilder:validation:XValidation:message="bootDiskProfile and encryptionConfig must not be set when swapConfig is not enabled",rule="(has(self.enabled) && self.enabled) || (!has(self.bootDiskProfile) && !has(self.encryptionConfig))"
+type SwapConfig struct {
+	// Enabled creates the swap file on the node. Defaults to false, which
+	// neither creates a swap file nor inherits the source node pool's swap.
+	// +optional
+	Enabled bool `json:"enabled,omitempty"`
+	// EncryptionConfig configures the encryption of the swap file. The swap
+	// file is encrypted with a key that the node generates at boot, unless
+	// encryptionConfig.disabled is true.
+	// +optional
+	EncryptionConfig *SwapEncryptionConfig `json:"encryptionConfig,omitempty"`
+	// BootDiskProfile creates the swap file on the boot disk. Omit it to use the
+	// automatic size GKE derives from the machine's memory and the boot disk.
+	// +optional
+	BootDiskProfile *SwapBootDiskProfile `json:"bootDiskProfile,omitempty"`
+}
+
+// SwapEncryptionConfig defines the encryption of the swap file.
+type SwapEncryptionConfig struct {
+	// Disabled turns off the encryption of the swap file.
+	// +optional
+	Disabled *bool `json:"disabled,omitempty"`
+}
+
+// SwapBootDiskProfile defines a swap file on the boot disk.
+type SwapBootDiskProfile struct {
+	// SwapSizeGib is the size of the swap file in GiB. Omit it to use the
+	// automatic size, which GKE derives from the machine's memory: twice the
+	// memory up to 8 GiB, plus 8 GiB above that, at most half of the boot disk.
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	SwapSizeGib *int64 `json:"swapSizeGib,omitempty"`
+}
+
+// AdvancedMachineFeatures defines advanced CPU and virtualisation options for a GCE instance.
+type AdvancedMachineFeatures struct {
+	// EnableNestedVirtualization defines whether the instance can run nested virtual machines.
+	// Only supported on Intel-based machine families; not supported on E2, AMD, Arm or
+	// Confidential VM instances.
+	// +optional
+	EnableNestedVirtualization *bool `json:"enableNestedVirtualization,omitempty"`
+	// ThreadsPerCore is the number of threads per physical core. Machine types default to 2
+	// (simultaneous multithreading); set 1 to disable SMT. With 1 the guest sees half the
+	// machine type's vCPUs while GCE still bills the full count, so Karpenter sizes the node
+	// at half. Not supported on every family (for example C4A, H3, N4A, T2A, T2D and
+	// shared-core types); GCE rejects an unsupported machine type at create.
+	// +kubebuilder:validation:Enum=1;2
+	// +optional
+	ThreadsPerCore *int32 `json:"threadsPerCore,omitempty"`
 }
 
 // GCENodeClass is the Schema for the GCENodeClass API
@@ -383,11 +654,11 @@ const (
 	// 1. A field changes its default value for an existing field that is already hashed
 	// 2. A field is added to the hash calculation with an already-set value
 	// 3. A field is removed from the hash calculations
-	GCENodeClassHashVersion = "v4"
+	GCENodeClassHashVersion = "v5"
 )
 
 func (in *GCENodeClass) Hash() string {
-	return fmt.Sprint(lo.Must(hashstructure.Hash([]interface{}{
+	return fmt.Sprint(lo.Must(hashstructure.Hash([]any{
 		in.Spec,
 		in.ImageFamily(),
 	}, hashstructure.FormatV2, &hashstructure.HashOptions{
@@ -473,4 +744,59 @@ func (in *GCENodeClass) GetMaxPods() int32 {
 		return *in.Spec.KubeletConfiguration.MaxPods
 	}
 	return KubeletMaxPods
+}
+
+// BootDiskSwapConfig returns the boot-disk swap configuration, or nil when the
+// node class does not enable it.
+func (in *GCENodeClass) BootDiskSwapConfig() *SwapConfig {
+	if in == nil || in.Spec.LinuxNodeConfig == nil {
+		return nil
+	}
+	swap := in.Spec.LinuxNodeConfig.SwapConfig
+	if swap == nil || !swap.Enabled {
+		return nil
+	}
+	return swap
+}
+
+// BootDiskSwapRequestedGiB returns the explicitly requested swap file size, or
+// 0 when the size is automatic.
+func (in *GCENodeClass) BootDiskSwapRequestedGiB() int64 {
+	swap := in.BootDiskSwapConfig()
+	if swap == nil || swap.BootDiskProfile == nil || swap.BootDiskProfile.SwapSizeGib == nil {
+		return 0
+	}
+	return *swap.BootDiskProfile.SwapSizeGib
+}
+
+// BootDiskSwapEncrypted reports whether the swap file is encrypted, which it is
+// unless encryptionConfig.disabled is true.
+func (in *GCENodeClass) BootDiskSwapEncrypted() bool {
+	swap := in.BootDiskSwapConfig()
+	return swap != nil && (swap.EncryptionConfig == nil || swap.EncryptionConfig.Disabled == nil || !*swap.EncryptionConfig.Disabled)
+}
+
+// GKEValue returns the strategy as GKE spells it in node labels and kube-env.
+func (s GPUSharingStrategy) GKEValue() string {
+	switch s {
+	case GPUSharingStrategyTimeSharing:
+		return "time-sharing"
+	default:
+		return ""
+	}
+}
+
+// PodSubnetRangeNames returns the NodeClass-configured pod secondary range names.
+// An empty result means the launch path should discover the cluster's pod ranges.
+func (in *GCENodeClass) PodSubnetRangeNames() []string {
+	if in == nil {
+		return nil
+	}
+	if len(in.Spec.SubnetRangeNames) > 0 {
+		return append([]string(nil), in.Spec.SubnetRangeNames...)
+	}
+	if in.Spec.SubnetRangeName != nil && *in.Spec.SubnetRangeName != "" {
+		return []string{*in.Spec.SubnetRangeName}
+	}
+	return nil
 }

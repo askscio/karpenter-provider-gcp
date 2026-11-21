@@ -23,7 +23,16 @@ version: 0.0.0
 # It is recommended to use it with quotes.
 appVersion: "0.0.0"
 
+dependencies:
+  - name: node-problem-detector
+    version: "2.4.1"
+    repository: oci://ghcr.io/deliveryhero/helm-charts
+    condition: node-problem-detector.enabled
+
 annotations:
+  artifacthub.io/signKey: |
+    fingerprint: 7D575660AC2C6650E263439577A23E34D5FE007A
+    url: https://cloudpilot-ai.github.io/karpenter-provider-gcp/keys/7D575660AC2C6650E263439577A23E34D5FE007A.asc
   artifacthub.io/links: |
     - name: source
       url: https://github.com/cloudpilot-ai/karpenter-provider-gcp

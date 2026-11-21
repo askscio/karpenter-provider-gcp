@@ -32,6 +32,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	"sigs.k8s.io/karpenter/pkg/utils/node"
+	"sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
 
 	interruptionevents "github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/controllers/interruption/events"
 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/providers/offerings/unavailableofferings"
@@ -43,6 +44,8 @@ const (
 
 	NodeConditionReasonKubeletNotReady = "KubeletNotReady"
 	NodeConditionMessageShuttingDown   = "node is shutting down"
+
+	NodeConditionTypeGCESpotPreempting = "GCESpotPreempting"
 
 	InterruptionReason = "interruption"
 )
@@ -84,8 +87,13 @@ func (c *Controller) handleStoppingSpotInstances(ctx context.Context) error {
 			continue
 		}
 
-		condition := node.GetCondition(&currentNode, corev1.NodeReady)
-		if condition.Status != corev1.ConditionTrue && condition.Reason == NodeConditionReasonKubeletNotReady && condition.Message == NodeConditionMessageShuttingDown {
+		switch {
+		case isPreempting(&currentNode):
+			c.recorder.Publish(interruptionevents.PreemptionNoticeReceived(&currentNode)...)
+			if err := c.cleanNodeClaimByInstanceName(ctx, currentNode.Name, true); err != nil {
+				return fmt.Errorf("cleaning node claim: %w", err)
+			}
+		case isShuttingDown(&currentNode):
 			if err := c.cleanNodeClaimByInstanceName(ctx, currentNode.Name, false); err != nil {
 				return fmt.Errorf("cleaning node claim: %w", err)
 			}
@@ -95,12 +103,23 @@ func (c *Controller) handleStoppingSpotInstances(ctx context.Context) error {
 	return nil
 }
 
+func isPreempting(n *corev1.Node) bool {
+	return node.GetCondition(n, NodeConditionTypeGCESpotPreempting).Status == corev1.ConditionTrue
+}
+
+func isShuttingDown(n *corev1.Node) bool {
+	condition := node.GetCondition(n, corev1.NodeReady)
+	return condition.Status != corev1.ConditionTrue &&
+		condition.Reason == NodeConditionReasonKubeletNotReady &&
+		condition.Message == NodeConditionMessageShuttingDown
+}
+
 func (c *Controller) cleanNodeClaimByInstanceName(ctx context.Context, instanceName string, markUnavailable bool) error {
 	nodeClaim, err := c.getNodeClaimByNodeName(ctx, instanceName)
 	if err != nil {
 		return fmt.Errorf("getting node claim by node name: %w", err)
 	}
-	if !nodeClaim.DeletionTimestamp.IsZero() {
+	if nodeClaim == nil || !nodeClaim.DeletionTimestamp.IsZero() {
 		return nil
 	}
 	zone := nodeClaim.Labels[corev1.LabelTopologyZone]
@@ -134,9 +153,11 @@ func (c *Controller) deleteNodeClaim(ctx context.Context, nodeClaim *karpv1.Node
 	log.FromContext(ctx).Info("initiating delete from interruption message", "nodeClaim", nodeClaim.Name)
 	c.recorder.Publish(interruptionevents.TerminatingOnInterruption(nodeClaim)...)
 	metrics.NodeClaimsDisruptedTotal.Inc(map[string]string{
-		metrics.ReasonLabel:       InterruptionReason,
-		metrics.NodePoolLabel:     nodeClaim.Labels[karpv1.NodePoolLabelKey],
-		metrics.CapacityTypeLabel: nodeClaim.Labels[karpv1.CapacityTypeLabelKey],
+		metrics.ReasonLabel:              InterruptionReason,
+		metrics.NodePoolLabel:            nodeClaim.Labels[karpv1.NodePoolLabelKey],
+		metrics.CapacityTypeLabel:        nodeClaim.Labels[karpv1.CapacityTypeLabelKey],
+		metrics.ConsolidationPolicyLabel: "",
+		metrics.TerminationModeLabel:     nodeclaim.DisruptionTerminationMode(nodeClaim),
 	})
 	return nil
 }
@@ -153,5 +174,5 @@ func (c *Controller) getNodeClaimByNodeName(ctx context.Context, nodeName string
 		}
 	}
 
-	return nil, fmt.Errorf("no nodeclaim found for node %s", nodeName)
+	return nil, nil
 }

@@ -6,13 +6,17 @@ Karpenter for GCP is configured via environment variables passed to the controll
 
 Feature gates control opt-in or experimental behaviors. They are passed as a comma-separated list via the `FEATURE_GATES` environment variable.
 
-| Feature Gate              | Helm value                                        | Default | Status | Description                                                                                                                                                                                    |
-|---------------------------|---------------------------------------------------|---------|--------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `NodeRepair`              | `controller.featureGates.nodeRepair`              | `false` | Alpha  | Automatically replaces nodes that fail GKE Node Problem Detector health checks.                                                                                                                |
-| `ReservedCapacity`        | `controller.featureGates.reservedCapacity`        | `false` | Beta   | Enables scheduling to reserved/committed GCP capacity. Disabled until GCE reservation support is implemented (see [#239](https://github.com/cloudpilot-ai/karpenter-provider-gcp/issues/239)). |
-| `SpotToSpotConsolidation` | `controller.featureGates.spotToSpotConsolidation` | `true`  | Beta   | Allows consolidation to replace a Spot node with a cheaper Spot node (both single- and multi-node).                                                                                            |
-| `NodeOverlay`             | `controller.featureGates.nodeOverlay`             | `false` | Alpha  | Applies `NodeOverlay` resources to instance type scheduling decisions.                                                                                                                         |
-| `StaticCapacity`          | `controller.featureGates.staticCapacity`          | `false` | Alpha  | Enables NodePools with `spec.replicas` set to maintain a fixed number of nodes regardless of pod demand.                                                                                       |
+| Feature Gate                | Helm value                                          | Default | Status | Description                                                                                                                                                                                    |
+|-----------------------------|-----------------------------------------------------|---------|--------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `NodeRepair`                | `controller.featureGates.nodeRepair`                | `false` | Alpha  | Replaces unhealthy nodes through budgeted repair; see [Node repair](node-repair.md).                                                                                                           |
+| `ReservedCapacity`          | `controller.featureGates.reservedCapacity`          | `false` | Beta   | Enables scheduling to reserved/committed GCP capacity. Disabled until GCE reservation support is implemented (see [#239](https://github.com/cloudpilot-ai/karpenter-provider-gcp/issues/239)). |
+| `SpotToSpotConsolidation`   | `controller.featureGates.spotToSpotConsolidation`   | `true`  | Beta   | Allows consolidation to replace a Spot node with a cheaper Spot node (both single- and multi-node).                                                                                            |
+| `NodeOverlay`               | `controller.featureGates.nodeOverlay`               | `false` | Alpha  | Applies `NodeOverlay` resources to instance type scheduling decisions.                                                                                                                         |
+| `StaticCapacity`            | `controller.featureGates.staticCapacity`            | `false` | Alpha  | Enables NodePools with `spec.replicas` set to maintain a fixed number of nodes regardless of pod demand.                                                                                       |
+| `CapacityBuffer`            | `controller.featureGates.capacityBuffer`            | `false` | Alpha  | Enables `CapacityBuffer` resources to pre-provision spare capacity.                                                                                                                            |
+| `TerminateFirstDrift`       | `controller.featureGates.terminateFirstDrift`       | `false` | Alpha  | Allows delete-first drift when replacement capacity cannot be staged in supported constrained pools.                                                                                           |
+| `TerminateFirstRepair`      | `controller.featureGates.terminateFirstRepair`      | `false` | Alpha  | Allows delete-first modern repair in supported constrained pools; requires NodeRepair and legacy mode off.                                                                                     |
+| `PodDeletionCostManagement` | `controller.featureGates.podDeletionCostManagement` | `false` | Alpha  | Manages pod-deletion-cost annotations to favor consolidation targets during ReplicaSet scale-down.                                                                                             |
 
 Example Helm override to enable `NodeRepair`:
 
@@ -22,17 +26,75 @@ controller:
     nodeRepair: true
 ```
 
+### Terminate-first disruption (Alpha)
+
+`terminateFirstDrift` and `terminateFirstRepair` permit a static NodePool at its node limit to delete the affected node before refilling capacity. This can temporarily reduce available capacity. Dynamic NodePools require reserved-capacity support for terminate-first fallback; GCP does not yet implement it ([#239](https://github.com/cloudpilot-ai/karpenter-provider-gcp/issues/239)). These gates do not bypass disruption budgets or provide a general on-demand/Spot quota workaround. `terminateFirstRepair` is ignored when NodeRepair is disabled or legacy repair is enabled.
+
+### Pod deletion-cost management (Alpha)
+
+When `podDeletionCostManagement` is enabled, Karpenter manages `controller.kubernetes.io/pod-deletion-cost` annotations so ReplicaSet scale-down favors consolidation targets. Existing pod-deletion-cost annotations no longer influence Karpenter's disruption costs in this mode. The Helm chart grants Pod `patch` permission only when this gate is enabled; custom RBAC must grant it too.
+
+### CapacityBuffer (Alpha)
+
+`CapacityBuffer` is an Alpha feature that pre-provisions spare capacity so pending pods can schedule without waiting for new nodes. It is disabled by default; enable it with `controller.featureGates.capacityBuffer`. This provider does not install the `autoscaling.x-k8s.io/v1beta1` `CapacityBuffer` CRD; neither the `karpenter-crd` chart nor the `karpenter` chart ships it. GKE provides the CRD natively starting at cluster version `1.35.2-gke.1842000`. Enabling `controller.featureGates.capacityBuffer` on a cluster where the CRD is not already installed fails at template-render time during `helm install` or `helm upgrade`.
+
+```yaml
+controller:
+  featureGates:
+    capacityBuffer: true
+```
+
 ## Controller Options
 
 These options configure the controller's runtime behavior.
 
-| Option                        | Env var                     | Helm value                              | Default | Description                                                                                                                                       |
-|-------------------------------|-----------------------------|-----------------------------------------|---------|---------------------------------------------------------------------------------------------------------------------------------------------------|
-| `--disable-controller-warmup` | `DISABLE_CONTROLLER_WARMUP` | `controller.disableControllerWarmup`    | `true`  | When `false`, controllers pre-populate caches before winning leader election, reducing failover time. Set to `false` in production for better HA. |
-| `--log-level`                 | `LOG_LEVEL`                 | `logLevel`                              | `info`  | Controller log level (`debug`, `info`, `warn`, `error`).                                                                                          |
-| `--batch-max-duration`        | `BATCH_MAX_DURATION`        | `controller.settings.batchMaxDuration`  | `10s`   | Maximum time Karpenter batches incoming pods before provisioning.                                                                                 |
-| `--batch-idle-duration`       | `BATCH_IDLE_DURATION`       | `controller.settings.batchIdleDuration` | `1s`    | Idle time after the last pod event before Karpenter triggers provisioning.                                                                        |
-| `--ignore-dra-requests`       | `IGNORE_DRA_REQUESTS`       | `controller.settings.ignoreDRARequests` | `true`  | When `true`, Karpenter ignores pods' Dynamic Resource Allocation requests during scheduling simulations.                                          |
+| Option                        | Env var                     | Helm value                              | Default            | Description                                                                                                                                       |
+|-------------------------------|-----------------------------|-----------------------------------------|--------------------|---------------------------------------------------------------------------------------------------------------------------------------------------|
+| `--disable-controller-warmup` | `DISABLE_CONTROLLER_WARMUP` | `controller.disableControllerWarmup`    | `true`             | When `false`, controllers pre-populate caches before winning leader election, reducing failover time. Set to `false` in production for better HA. |
+| `--log-level`                 | `LOG_LEVEL`                 | `logLevel`                              | `info`             | Controller log level (`debug`, `info`, `warn`, `error`).                                                                                          |
+| `--batch-max-duration`        | `BATCH_MAX_DURATION`        | `controller.settings.batchMaxDuration`  | `10s`              | Maximum time Karpenter batches incoming pods before provisioning.                                                                                 |
+| `--batch-idle-duration`       | `BATCH_IDLE_DURATION`       | `controller.settings.batchIdleDuration` | `1s`               | Idle time after the last pod event before Karpenter triggers provisioning.                                                                        |
+| `--ignore-dra-requests`       | `IGNORE_DRA_REQUESTS`       | `controller.settings.ignoreDRARequests` | `true`             | When `true`, Karpenter ignores pods' Dynamic Resource Allocation requests during scheduling simulations.                                          |
+| `--preference-policy`         | `PREFERENCE_POLICY`         | `controller.settings.preferencePolicy`  | `Respect`          | How Karpenter handles soft scheduling preferences. Valid values are `Respect` and `Ignore`.                                                       |
+| `--legacy-node-repair`        | `LEGACY_NODE_REPAIR`        | `controller.settings.legacyNodeRepair`  | `false`            | Runs the pre-v1.15 forceful repair controller; requires NodeRepair.                                                                               |
+| `--scheduler-config`          | `SCHEDULER_CONFIG`          | `controller.settings.schedulerConfig`   | `{}` (env omitted) | JSON-serialized scheduler behavior to mirror during scheduling simulations.                                                                       |
+
+### Legacy node repair
+
+Modern repair respects NodePool budgets and the Node's `karpenter.sh/do-not-repair` veto, and stages replacements before deletion. `legacyNodeRepair: true` restores forceful repair without those admission controls. Conditions and tolerations are unchanged. See [Node repair](node-repair.md) and the [migration guide](../MIGRATION.md).
+
+Native in-place reboot is not supported; current GCP repair policies always replace nodes. Reboot support is tracked in [#681](https://github.com/cloudpilot-ai/karpenter-provider-gcp/issues/681).
+
+### Scheduler configuration
+
+Leave `schedulerConfig` empty unless matching a known cluster scheduler configuration. It accepts `podTopologySpread.defaultConstraints` for Karpenter's scheduling simulations; it does not reconfigure GKE's kube-scheduler. Mismatched defaults can produce different simulated and actual placement.
+
+```yaml
+controller:
+  settings:
+    schedulerConfig:
+      podTopologySpread:
+        defaultConstraints:
+          - maxSkew: 1
+            topologyKey: topology.kubernetes.io/zone
+            whenUnsatisfiable: ScheduleAnyway
+```
+
+### CSI attachment-limit predictions
+
+The GCP provider does not yet predict CSI volume attachment limits for new instance types ([#682](https://github.com/cloudpilot-ai/karpenter-provider-gcp/issues/682)). Limits reported by registered nodes' `CSINode` objects still apply. The core upgrade does not add provider predictions.
+
+### Preference policy
+
+`controller.settings.preferencePolicy` defaults to `Respect`, which retains soft scheduling preferences during provisioning and consolidation. Set it to `Ignore` to disregard `preferredDuringSchedulingIgnoredDuringExecution` node affinity, pod affinity, and pod anti-affinity, as well as topology spread constraints with `whenUnsatisfiable: ScheduleAnyway`.
+
+`Ignore` does not bypass required node or pod affinity/anti-affinity, topology spread constraints with `whenUnsatisfiable: DoNotSchedule`, taints, resource requirements, PodDisruptionBudgets, or other disruption controls.
+
+```yaml
+controller:
+  settings:
+    preferencePolicy: Ignore
+```
 
 ### Dynamic Resource Allocation (DRA)
 
@@ -40,7 +102,7 @@ Dynamic Resource Allocation (DRA) is a Kubernetes API for requesting and sharing
 
 Karpenter ignores DRA requests during scheduling simulations by default (`controller.settings.ignoreDRARequests: true`). This preserves scheduling behavior for clusters without DRA drivers, the common case on GKE.
 
-Set `ignoreDRARequests` to `false` only when the cluster has DRA drivers installed and runs workloads that schedule against `ResourceClaim`s. When disabled, Karpenter registers the upstream device-allocation controller and accounts for DRA device availability when provisioning.
+Set `ignoreDRARequests` to `false` only when the cluster has DRA drivers installed and runs workloads that schedule against `ResourceClaim`s. When disabled, Karpenter registers the upstream device-allocation controller and accounts for already-published in-cluster DRA device availability. The GCP provider does not yet publish instance-type DRA device templates for provisioning new accelerator nodes ([#524](https://github.com/cloudpilot-ai/karpenter-provider-gcp/issues/524)).
 
 ```yaml
 controller:
@@ -52,15 +114,42 @@ DRA is a Kubernetes-level feature. Review the [Kubernetes DRA documentation](htt
 
 ## GCP-specific Settings
 
-| Setting             | Env var                            | Helm value                                        | Required | Description                                                                                                                                                                                                                                                                                |
-|---------------------|------------------------------------|---------------------------------------------------|----------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| Project ID          | `PROJECT_ID`                       | `controller.settings.projectID`                   | Yes      | GCP project where nodes are provisioned.                                                                                                                                                                                                                                                   |
-| Cluster name        | `CLUSTER_NAME`                     | `controller.settings.clusterName`                 | Yes      | GKE cluster name. Used to scope instance discovery.                                                                                                                                                                                                                                        |
-| Cluster location    | `CLUSTER_LOCATION`                 | `controller.settings.clusterLocation`             | Yes      | GKE cluster location (zone or region, e.g. `us-central1-f`).                                                                                                                                                                                                                               |
-| Node location       | `NODE_LOCATION`                    | `controller.settings.nodeLocation`                | No       | Override zone for node placement. Defaults to cluster location.                                                                                                                                                                                                                            |
-| VM memory overhead  | `VM_MEMORY_OVERHEAD_PERCENT`       | `controller.settings.vmMemoryOverheadPercent`     | No       | Fraction of node memory reserved for OS/kubelet overhead (e.g. `0.075` = 7.5%).                                                                                                                                                                                                            |
-| Bootstrap pool name | `DEFAULT_NODEPOOL_TEMPLATE_NAME`   | `controller.settings.defaultNodePoolTemplateName` | No       | Pin the GKE node pool used as the bootstrap metadata source. When set, Karpenter uses this pool exclusively. Leave empty to use automatic discovery (`default-pool` → first alphabetical RUNNING pool → `karpenter-fallback` creation). See [Bootstrap pool selection](bootstrap-pool.md). |
-| Default SA          | `DEFAULT_NODEPOOL_SERVICE_ACCOUNT` | `controller.env`                                  | No       | Default service account for provisioned nodes (see [Service account resolution](#service-account-resolution)).                                                                                                                                                                             |
+| Setting                    | Env var                            | Helm value                                          | Required | Description                                                                                                                                                                                                                                                                                |
+|----------------------------|------------------------------------|-----------------------------------------------------|----------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Project ID                 | `PROJECT_ID`                       | `controller.settings.projectID`                     | Yes      | GCP project where nodes are provisioned.                                                                                                                                                                                                                                                   |
+| Cluster name               | `CLUSTER_NAME`                     | `controller.settings.clusterName`                   | Yes      | GKE cluster name. Used to scope instance discovery.                                                                                                                                                                                                                                        |
+| Cluster location           | `CLUSTER_LOCATION`                 | `controller.settings.clusterLocation`               | Yes      | GKE cluster location (zone or region, e.g. `us-central1-f`).                                                                                                                                                                                                                               |
+| Node location              | `NODE_LOCATION`                    | `controller.settings.nodeLocation`                  | No       | Override zone for node placement. Defaults to cluster location.                                                                                                                                                                                                                            |
+| VM memory overhead         | `VM_MEMORY_OVERHEAD_PERCENT`       | `controller.settings.vmMemoryOverheadPercent`       | No       | Fraction of node memory reserved for OS/kubelet overhead (e.g. `0.075` = 7.5%).                                                                                                                                                                                                            |
+| Bootstrap pool name        | `DEFAULT_NODEPOOL_TEMPLATE_NAME`   | `controller.settings.defaultNodePoolTemplateName`   | No       | Pin the GKE node pool used as the bootstrap metadata source. When set, Karpenter uses this pool exclusively. Leave empty to use automatic discovery (`default-pool` → first alphabetical RUNNING pool → `karpenter-fallback` creation). See [Bootstrap pool selection](bootstrap-pool.md). |
+| Default SA                 | `DEFAULT_NODEPOOL_SERVICE_ACCOUNT` | `controller.settings.defaultNodepoolServiceAccount` | No       | Default service account for provisioned nodes (see [Service account resolution](#service-account-resolution)).                                                                                                                                                                             |
+| Quota backoff              | `QUOTA_EXCEEDED_TTL`               | `controller.settings.quotaExceededTTL`              | No       | How long an instance type stays unavailable after a launch fails with `QUOTA_EXCEEDED` (default `30m`). Set to `0s` to disable (see [Quota exhaustion](#quota-exhaustion)).                                                                                                                |
+| Telemetry                  | `TELEMETRY`                        | `controller.settings.telemetry`                     | No       | Send anonymized resource totals and Spot interruption events to CloudPilot AI (default `false`; see [Telemetry](#telemetry)).                                                                                                                                                              |
+| Stockout backoff           | `STOCKOUT_TTL`                     | `controller.settings.stockoutTTL`                   | No       | How long an instance type stays unavailable in a zone after a launch fails with `ZONE_RESOURCE_POOL_EXHAUSTED` (default `5m`). See [Launch failure backoff](#launch-failure-backoff).                                                                                                      |
+| IP space backoff           | `IP_SPACE_EXHAUSTED_TTL`           | `controller.settings.ipSpaceExhaustedTTL`           | No       | How long an instance type stays unavailable in a zone after a launch fails with `IP_SPACE_EXHAUSTED` on every pod range (default `30s`).                                                                                                                                                   |
+| Unsupported config backoff | `UNSUPPORTED_CONFIGURATION_TTL`    | `controller.settings.unsupportedConfigurationTTL`   | No       | How long an instance type stays unavailable in a zone after GCE reports the zone does not support the requested configuration (default `1h`).                                                                                                                                              |
+| Launch timeout             | `LAUNCH_TIMEOUT`                   | `controller.settings.launchTimeout`                 | No       | How long a NodeClaim may keep failing to launch with a non-capacity error before Karpenter deletes and replaces it (default `5m`).                                                                                                                                                         |
+
+### Quota exhaustion
+
+When GCE rejects a launch because a project quota is exhausted (for example `N2_CPUS` or `NVIDIA_L4_GPUS`), Karpenter marks that instance type unavailable for the same capacity type in every zone of the region, because GCE enforces these quotas per region. Karpenter then tries the next instance type, and a Spot NodeClaim can fall back to on-demand. The offering becomes available again after `QUOTA_EXCEEDED_TTL`. Other instance types in the same machine family share the quota, so each is marked unavailable when its own launch fails.
+
+Setting `QUOTA_EXCEEDED_TTL=0s` restores the previous behavior: the failed launch still moves on to the next instance type, but nothing is marked unavailable and the next NodeClaim retries the same instance type.
+
+### Telemetry
+
+With `TELEMETRY=true`, the controller sends CloudPilot AI two kinds of reports, keyed by a hash of the cluster's `kube-system` namespace UID:
+
+- Once per controller start: resource totals with different scopes. CPU and memory capacity, and the list of instance types, cover only nodes Karpenter has initialized, so a cluster that also runs GKE-managed node pools reports less capacity than it has. CPU and memory requests cover every pod in the cluster, and usage covers every node the metrics API reports.
+- Every 10 seconds, when there are any: Spot interruption events, each with the node's region, zone, instance type and creation time.
+
+It sends nothing that names a pod, node or workload. Telemetry is off by default, and with it off the telemetry controller does not run.
+
+### Launch failure backoff
+
+When a launch fails because GCE has no capacity, Karpenter marks that instance type, zone and capacity type unavailable, deletes the NodeClaim, and creates a new NodeClaim from the remaining offerings in its next provisioning batch. How long the offering stays unavailable depends on the GCE error: `STOCKOUT_TTL` for `ZONE_RESOURCE_POOL_EXHAUSTED`, `IP_SPACE_EXHAUSTED_TTL` for `IP_SPACE_EXHAUSTED`, `UNSUPPORTED_CONFIGURATION_TTL` for `MACHINE_TYPE_UNSUPPORTED` and `configuration_availability`, and `QUOTA_EXCEEDED_TTL` for quota errors. A shorter TTL retries the offering sooner. A longer TTL moves new NodeClaims to other instance types and zones for longer.
+
+Other launch errors keep the NodeClaim and retry with exponential backoff from 1s to 1m. If the NodeClaim has still not launched after `LAUNCH_TIMEOUT`, Karpenter deletes it and creates a new one. `STOCKOUT_TTL`, `IP_SPACE_EXHAUSTED_TTL`, `UNSUPPORTED_CONFIGURATION_TTL` and `LAUNCH_TIMEOUT` must be positive; `QUOTA_EXCEEDED_TTL` also accepts `0s` to disable quota backoff.
 
 ### Service account resolution
 
@@ -72,15 +161,16 @@ Karpenter resolves the service account for provisioned nodes in this order:
 
 If none are available, node provisioning fails.
 
+When `DEFAULT_NODEPOOL_SERVICE_ACCOUNT` is unset, the controller looks up the project's Compute Engine default service account at startup. This lookup needs the `compute.projects.get` permission, which the [controller role](../deploy/iam/karpenter-controller-role.yaml) includes. If the lookup fails, the controller exits and Kubernetes restarts the pod to retry. This happens even when every GCENodeClass sets `spec.serviceAccount`. To skip the lookup, set `DEFAULT_NODEPOOL_SERVICE_ACCOUNT`.
+
 For production clusters, use a dedicated service account with minimal permissions ([`roles/container.nodeServiceAccount`](https://cloud.google.com/kubernetes-engine/docs/how-to/hardening-your-cluster#use_least_privilege_sa)). Set `DEFAULT_NODEPOOL_SERVICE_ACCOUNT` or `spec.serviceAccount` accordingly.
 
 Example Helm override:
 
 ```yaml
 controller:
-  env:
-    - name: DEFAULT_NODEPOOL_SERVICE_ACCOUNT
-      value: "my-node-sa@my-project.iam.gserviceaccount.com"
+  settings:
+    defaultNodepoolServiceAccount: "my-node-sa@my-project.iam.gserviceaccount.com"
 ```
 
 ## Security Contexts
@@ -144,9 +234,60 @@ podDisruptionBudget:
   maxUnavailable: 1
 ```
 
+## Topology Spread Constraints
+
+[Topology spread constraints](https://kubernetes.io/docs/concepts/scheduling-eviction/topology-spread-constraints/) cap how unevenly the controller's pods may be distributed across a topology domain such as a zone or node, and let you choose whether Karpenter still schedules a pod when the skew limit (`maxSkew`) cannot be honored (`whenUnsatisfiable`). The chart can set them on the controller Deployment's pod template. The controller runs 2 replicas by default (`controller.replicaCount: 2`), so spreading them across zones improves availability.
+
+| Helm value                             | Default | Description                                                               |
+|----------------------------------------|---------|---------------------------------------------------------------------------|
+| `controller.topologySpreadConstraints` | `[]`    | Topology spread constraints for the controller Deployment's pod template. |
+
+The value accepts the standard Kubernetes `topologySpreadConstraints` schema. The field is rendered into `spec.template.spec.topologySpreadConstraints` only when you provide a non-empty list, so leaving it unset applies no constraints.
+
+```yaml
+controller:
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/name: karpenter
+```
+
+## Additional Labels
+
+`additionalLabels` adds labels to the `metadata.labels` of the Kubernetes resources that the chart renders: the controller Deployment and the controller pods it creates (its pod template), the Service, the ServiceAccount, the chart's ClusterRoles and ClusterRoleBindings, its Roles and RoleBindings, the PodDisruptionBudget, and the ServiceMonitor. The chart merges `additionalLabels` with the labels it sets by default, and its own default labels win, so `additionalLabels` cannot override any label the chart manages (`helm.sh/chart`, `app.kubernetes.io/name`, `app.kubernetes.io/instance`, `app.kubernetes.io/version`, and `app.kubernetes.io/managed-by`). Because `app.kubernetes.io/name` and `app.kubernetes.io/instance` are among those managed labels, `additionalLabels` cannot change the controller's immutable pod selector.
+
+| Helm value         | Default | Description                                                                     |
+|--------------------|---------|---------------------------------------------------------------------------------|
+| `additionalLabels` | `{}`    | Labels added to the metadata of the Kubernetes resources rendered by the chart. |
+
+The labels do not reach the CustomResourceDefinitions. Helm installs the CRD manifests in the chart's `crds/` directory as-is, without templating, so chart values such as `additionalLabels` never apply to them. The CRDs are also distributed through the separate `karpenter-crd` chart.
+
+This value is distinct from `serviceMonitor.additionalLabels`, which applies only to the ServiceMonitor to match a Prometheus instance's selector.
+
+```yaml
+additionalLabels:
+  team: platform
+  cost-center: infra-1234
+```
+
 ## NodePool Features
 
 These fields are set on `NodePool` objects, not on the controller. They are part of the karpenter-core API and are available in this provider.
+
+### Balanced consolidation policy (v1.14)
+
+Karpenter core v1.14 adds a third value, `Balanced`, to `spec.disruption.consolidationPolicy`, alongside `WhenEmpty` and `WhenEmptyOrUnderutilized`. `Balanced` sits between the two: it scores each consolidation action by weighing the share of NodePool cost it saves against the pod disruption it causes, and proceeds only when the savings justify the disruption. Higher-priority pods carry more disruption weight, so nodes running them are less likely to be consolidated. Reach for it when `WhenEmptyOrUnderutilized` churns too much on marginal consolidations but `WhenEmpty` leaves too much idle capacity. The default is unchanged (`WhenEmptyOrUnderutilized`).
+
+```yaml
+apiVersion: karpenter.sh/v1
+kind: NodePool
+spec:
+  disruption:
+    consolidationPolicy: Balanced
+```
 
 ### Karpenter core v1.13
 

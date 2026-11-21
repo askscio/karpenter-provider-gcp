@@ -19,16 +19,22 @@ package instance
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"cloud.google.com/go/compute/apiv1/computepb"
 	"github.com/patrickmn/go-cache"
+	"github.com/samber/lo"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/api/compute/v1"
 	containerv1 "google.golang.org/api/container/v1"
@@ -44,6 +50,9 @@ import (
 
 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/apis/v1alpha1"
 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/metadata"
+	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/operator/options"
+	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/providers/instancetype"
+	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/providers/nodepooltemplate"
 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/providers/offerings/unavailableofferings"
 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/utils"
 )
@@ -72,52 +81,442 @@ func TestIsInsufficientCapacityErrorNonMatching(t *testing.T) {
 	require.False(t, isInsufficientCapacityError(entry))
 }
 
-func TestExtractInsertInsufficientCapacityReasonMatchesReason(t *testing.T) {
+func TestExtractOperationInsufficientCapacityDetails(t *testing.T) {
 	t.Parallel()
 
-	reason, code, ok := extractInsertInsufficientCapacityReason(&googleapi.Error{
+	details, ok := extractOperationInsufficientCapacityDetails(&compute.Operation{
+		Name: "operation-123",
+		Error: &compute.OperationError{
+			Errors: []*compute.OperationErrorErrors{{
+				Code:    "ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS",
+				Message: "generic capacity message",
+				ErrorDetails: []*compute.OperationErrorErrorsErrorDetails{
+					{LocalizedMessage: &compute.LocalizedMessage{Message: "localized capacity message"}},
+					{ErrorInfo: &compute.ErrorInfo{Reason: "resource_availability"}},
+				},
+			}},
+		},
+	})
+
+	require.True(t, ok)
+	require.Equal(t, insufficientCapacityDetails{
+		code:             "ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS",
+		structuredReason: "resource_availability",
+		message:          "localized capacity message",
+		operation:        "operation-123",
+	}, details)
+}
+
+func TestExtractOperationInsufficientCapacityDetailsFallsBackToCode(t *testing.T) {
+	t.Parallel()
+
+	details, ok := extractOperationInsufficientCapacityDetails(&compute.Operation{
+		Name: "operation-123",
+		Error: &compute.OperationError{
+			Errors: []*compute.OperationErrorErrors{{
+				Code: "ZONE_RESOURCE_POOL_EXHAUSTED",
+			}},
+		},
+	})
+
+	require.True(t, ok)
+	require.Equal(t, "ZONE_RESOURCE_POOL_EXHAUSTED", details.message)
+	require.Empty(t, details.structuredReason)
+}
+
+func TestExtractInsertInsufficientCapacityDetailsMatchesReason(t *testing.T) {
+	t.Parallel()
+
+	details, ok := extractInsertInsufficientCapacityDetails(&googleapi.Error{
 		Errors: []googleapi.ErrorItem{{Reason: "IP_SPACE_EXHAUSTED_WITH_DETAILS"}},
 	})
 
 	require.True(t, ok)
-	require.Equal(t, "IP_SPACE_EXHAUSTED_WITH_DETAILS", reason)
-	require.Equal(t, "IP_SPACE_EXHAUSTED_WITH_DETAILS", code)
+	require.Equal(t, insufficientCapacityDetails{
+		code:             "IP_SPACE_EXHAUSTED_WITH_DETAILS",
+		structuredReason: "IP_SPACE_EXHAUSTED_WITH_DETAILS",
+		message:          "IP_SPACE_EXHAUSTED_WITH_DETAILS",
+	}, details)
 }
 
-func TestExtractInsertInsufficientCapacityReasonRequiresStructuredReason(t *testing.T) {
+func TestMachineTypeUnsupportedIsInsufficientCapacity(t *testing.T) {
 	t.Parallel()
 
-	reason, code, ok := extractInsertInsufficientCapacityReason(&googleapi.Error{
+	require.True(t, isInsufficientCapacityError(&compute.OperationErrorErrors{Code: "MACHINE_TYPE_UNSUPPORTED"}))
+	_, ok := extractInsertInsufficientCapacityDetails(&googleapi.Error{
+		Errors: []googleapi.ErrorItem{{Reason: "MACHINE_TYPE_UNSUPPORTED"}},
+	})
+	require.True(t, ok)
+}
+
+func TestExtractInsertInsufficientCapacityDetailsRequiresStructuredReason(t *testing.T) {
+	t.Parallel()
+
+	details, ok := extractInsertInsufficientCapacityDetails(&googleapi.Error{
 		Message: "some failure IP_SPACE_EXHAUSTED for range",
 	})
 
 	require.False(t, ok)
-	require.Empty(t, reason)
-	require.Empty(t, code)
+	require.Empty(t, details)
 }
 
-func TestExtractInsertInsufficientCapacityReasonNonMatching(t *testing.T) {
+func TestExtractInsertInsufficientCapacityDetailsNonMatching(t *testing.T) {
 	t.Parallel()
 
-	_, _, ok := extractInsertInsufficientCapacityReason(&googleapi.Error{Message: "some other issue"})
+	_, ok := extractInsertInsufficientCapacityDetails(&googleapi.Error{Message: "some other issue"})
 
 	require.False(t, ok)
 }
 
-func TestInsufficientCapacityBackoffTTLForIPSpace(t *testing.T) {
+func TestHandleZoneOperationErrorIncludesCapacityContext(t *testing.T) {
 	t.Parallel()
 
-	ttl := insufficientCapacityBackoffTTL("IP_SPACE_EXHAUSTED")
+	const operation = "operation-1788548040491-65aacca9e01b7-9614bc69-e30ce63a"
+	unavailable := unavailableofferings.NewUnavailableOfferings()
+	p := &DefaultProvider{unavailableOfferings: unavailable}
+	op := &compute.Operation{
+		Name: operation,
+		Error: &compute.OperationError{
+			Errors: []*compute.OperationErrorErrors{{
+				Code:    "ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS",
+				Message: "generic capacity message",
+				ErrorDetails: []*compute.OperationErrorErrorsErrorDetails{
+					{LocalizedMessage: &compute.LocalizedMessage{Message: "localized capacity message"}},
+					{ErrorInfo: &compute.ErrorInfo{Reason: "resource_availability"}},
+				},
+			}},
+		},
+	}
+	details, found := extractOperationInsufficientCapacityDetails(op)
+	require.True(t, found)
+	err := p.markInsufficientCapacity(context.Background(), "z3-highmem-8-highlssd", "us-east4-a", karpv1.CapacityTypeOnDemand, details)
 
-	require.Equal(t, ipSpaceInsufficientCapacityTTL, ttl)
+	require.True(t, cloudprovider.IsInsufficientCapacityError(err))
+	require.ErrorContains(t, err, "insufficient capacity, z3-highmem-8-highlssd on-demand/us-east4-a unavailable 5m0s")
+	require.ErrorContains(t, err, "reason=resource_availability, op="+operation+", code=ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS")
+	require.ErrorContains(t, err, "localized capacity message")
+	require.True(t, unavailable.IsUnavailable("z3-highmem-8-highlssd", "us-east4-a", karpv1.CapacityTypeOnDemand))
+
+	wrappedErr := fmt.Errorf("creating instance, failed to create instance after trying all instance types: %w", err)
+	require.True(t, cloudprovider.IsInsufficientCapacityError(wrappedErr))
+	wrapped := wrappedErr.Error()
+	if len(wrapped) > 300 {
+		wrapped = wrapped[:300]
+	}
+	for _, field := range []string{
+		"z3-highmem-8-highlssd",
+		"on-demand",
+		"us-east4-a",
+		"5m0s",
+		"ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS",
+		"resource_availability",
+		operation,
+	} {
+		require.Contains(t, wrapped, field)
+	}
 }
 
-func TestInsufficientCapacityBackoffTTLForOtherReasons(t *testing.T) {
+// Stockouts clear with time and are retried soon; unsupported configurations
+// do not, so retrying them on the stockout TTL only repeats a failing launch.
+func TestInsufficientCapacityBackoffTTL(t *testing.T) {
 	t.Parallel()
 
-	ttl := insufficientCapacityBackoffTTL("ZONE_RESOURCE_POOL_EXHAUSTED")
+	const (
+		unavailable = "unavailable"
+		unsupported = "unsupported configuration"
+		quota       = "quota exceeded"
+	)
+	tests := []struct {
+		name       string
+		details    insufficientCapacityDetails
+		wantTTL    time.Duration
+		wantStatus string
+	}{
+		{"stockout without reason", insufficientCapacityDetails{code: "ZONE_RESOURCE_POOL_EXHAUSTED"}, options.DefaultStockoutTTL, unavailable},
+		{"stockout with resource reason", insufficientCapacityDetails{code: "ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS", structuredReason: "resource_availability"}, options.DefaultStockoutTTL, unavailable},
+		{"stockout with unknown reason", insufficientCapacityDetails{code: "ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS", structuredReason: "some_new_reason"}, options.DefaultStockoutTTL, unavailable},
+		{"configuration availability", insufficientCapacityDetails{code: "ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS", structuredReason: "configuration_availability"}, options.DefaultUnsupportedConfigurationTTL, unsupported},
+		{"machine type unsupported", insufficientCapacityDetails{code: "MACHINE_TYPE_UNSUPPORTED", structuredReason: "MACHINE_TYPE_UNSUPPORTED"}, options.DefaultUnsupportedConfigurationTTL, unsupported},
+		{"ip space exhausted", insufficientCapacityDetails{code: "IP_SPACE_EXHAUSTED"}, options.DefaultIPSpaceExhaustedTTL, unavailable},
+		{"ip space exhausted with details", insufficientCapacityDetails{code: "IP_SPACE_EXHAUSTED_WITH_DETAILS"}, options.DefaultIPSpaceExhaustedTTL, unavailable},
+		{"ip space exhausted with configuration reason", insufficientCapacityDetails{code: "IP_SPACE_EXHAUSTED_WITH_DETAILS", structuredReason: "configuration_availability"}, options.DefaultIPSpaceExhaustedTTL, unavailable},
+		{"quota exceeded", insufficientCapacityDetails{code: "QUOTA_EXCEEDED"}, options.DefaultQuotaExceededTTL, quota},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ttl := insufficientCapacityBackoffTTL(context.Background(), tt.details)
+			require.Equal(t, tt.wantTTL, ttl)
+			err := newInsufficientCapacityError("n2-standard-4", "us-east4-a", karpv1.CapacityTypeOnDemand, ttl, tt.details)
+			require.ErrorContains(t, err, fmt.Sprintf("n2-standard-4 on-demand/us-east4-a %s %s ", tt.wantStatus, tt.wantTTL))
+		})
+	}
+}
 
-	require.Equal(t, unavailableofferings.DefaultTTL, ttl)
+func requireStoredTTL(t *testing.T, c *cache.Cache, instanceType, zone, capacityType string, want time.Duration) {
+	t.Helper()
+	_, expiration, found := c.GetWithExpiration(fmt.Sprintf("%s:%s:%s", capacityType, instanceType, zone))
+	require.True(t, found, "offering must be marked unavailable")
+	require.WithinDuration(t, time.Now().Add(want), expiration, 5*time.Second)
+}
+
+// An unsupported configuration must still be an insufficient capacity error so
+// core falls through to other offerings, but the provider message must not
+// describe it as a stockout.
+func TestHandleZoneOperationErrorUnsupportedConfiguration(t *testing.T) {
+	t.Parallel()
+
+	c := cache.New(unavailableofferings.DefaultTTL, unavailableofferings.CleanupInterval)
+	p := &DefaultProvider{unavailableOfferings: unavailableofferings.NewUnavailableOfferingsWithCache(c)}
+	operationErr := handleZoneOperationError(&compute.Operation{
+		Error: &compute.OperationError{
+			Errors: []*compute.OperationErrorErrors{{
+				Code:         "ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS",
+				ErrorDetails: []*compute.OperationErrorErrorsErrorDetails{{ErrorInfo: &compute.ErrorInfo{Reason: "configuration_availability"}}},
+			}},
+		},
+	})
+	capacityErr, ok := errors.AsType[*insufficientCapacityError](operationErr)
+	require.True(t, ok)
+	err := p.markInsufficientCapacity(context.Background(), "n2-standard-4", "us-east4-a", karpv1.CapacityTypeOnDemand, capacityErr.details)
+
+	require.True(t, cloudprovider.IsInsufficientCapacityError(err))
+	require.ErrorContains(t, err, "n2-standard-4 on-demand/us-east4-a unsupported configuration 1h0m0s")
+	require.ErrorContains(t, err, "reason=configuration_availability")
+	requireStoredTTL(t, c, "n2-standard-4", "us-east4-a", karpv1.CapacityTypeOnDemand, options.DefaultUnsupportedConfigurationTTL)
+}
+
+// A capacity error returned synchronously by Insert is classified by code:
+// only IP space exhaustion stops the caller from trying other instance types.
+func TestGetOrCreateInstanceInsertCapacityError(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		code          string
+		wantTTL       time.Duration
+		wantRetryable bool
+	}{
+		{"ZONE_RESOURCE_POOL_EXHAUSTED", options.DefaultStockoutTTL, true},
+		{"MACHINE_TYPE_UNSUPPORTED", options.DefaultUnsupportedConfigurationTTL, true},
+		{"IP_SPACE_EXHAUSTED", options.DefaultIPSpaceExhaustedTTL, false},
+		{"quotaExceeded", options.DefaultQuotaExceededTTL, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.code, func(t *testing.T) {
+			t.Parallel()
+
+			p := newFakeComputeProvider(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost {
+					http.NotFound(w, r)
+					return
+				}
+				w.WriteHeader(http.StatusBadRequest)
+				writeJSON(w, map[string]any{"error": map[string]any{"errors": []map[string]string{{"reason": tt.code}}}})
+			}))
+			p.computeDefaultSA = "123-compute@developer.gserviceaccount.com"
+			c := cache.New(unavailableofferings.DefaultTTL, unavailableofferings.CleanupInterval)
+			p.unavailableOfferings = unavailableofferings.NewUnavailableOfferingsWithCache(c)
+
+			_, _, retryable, err := p.getOrCreateInstance(context.Background(), spotOrOnDemandNodeClaim(), &v1alpha1.GCENodeClass{}, makeNonGPUIT(),
+				makeSourceMetadata("max-pods-per-node=110"),
+				makeCluster("projects/p/global/networks/my-vpc", "regions/us-central1/subnetworks/my-subnet", "pods", false),
+				"us-central1-a", karpv1.CapacityTypeOnDemand, nil, nil, 0, nil)
+
+			require.True(t, cloudprovider.IsInsufficientCapacityError(err))
+			require.Equal(t, tt.wantRetryable, retryable)
+			requireStoredTTL(t, c, "n2-standard-4", "us-central1-a", karpv1.CapacityTypeOnDemand, tt.wantTTL)
+		})
+	}
+}
+
+func TestIsIPSpaceExhausted(t *testing.T) {
+	t.Parallel()
+
+	require.True(t, isIPSpaceExhausted(insufficientCapacityDetails{code: "IP_SPACE_EXHAUSTED"}))
+	require.True(t, isIPSpaceExhausted(insufficientCapacityDetails{code: "IP_SPACE_EXHAUSTED_WITH_DETAILS"}))
+	require.False(t, isIPSpaceExhausted(insufficientCapacityDetails{code: "ZONE_RESOURCE_POOL_EXHAUSTED"}))
+}
+
+func TestHandleZoneOperationErrorPreservesReasonCode(t *testing.T) {
+	t.Parallel()
+
+	op := &compute.Operation{Error: &compute.OperationError{Errors: []*compute.OperationErrorErrors{{
+		Code: "IP_SPACE_EXHAUSTED",
+		// GCE messages do not necessarily repeat the reason code, so the code itself
+		// must survive the conversion for the pod range fallback to trigger.
+		Message: "IP address range of subnetwork is exhausted",
+	}}}}
+
+	capacityErr, ok := errors.AsType[*insufficientCapacityError](handleZoneOperationError(op))
+	require.True(t, ok)
+	require.Equal(t, "IP_SPACE_EXHAUSTED", capacityErr.details.code)
+	require.True(t, isIPSpaceExhausted(capacityErr.details))
+}
+
+func TestHandleZoneOperationErrorForNonCapacityFailure(t *testing.T) {
+	t.Parallel()
+
+	op := &compute.Operation{Error: &compute.OperationError{Errors: []*compute.OperationErrorErrors{{
+		Code:    "INVALID_FIELD_VALUE",
+		Message: "invalid field value",
+	}}}}
+
+	err := handleZoneOperationError(op)
+	require.Error(t, err)
+	_, ok := errors.AsType[*insufficientCapacityError](err)
+	require.False(t, ok)
+}
+
+func TestHandleZoneOperationErrorQuotaExceeded(t *testing.T) {
+	t.Parallel()
+
+	op := &compute.Operation{Error: &compute.OperationError{Errors: []*compute.OperationErrorErrors{{
+		Code:    "QUOTA_EXCEEDED",
+		Message: "Quota 'N2_CPUS' exceeded. Limit: 24.0 in region us-central1.",
+	}}}}
+
+	capacityErr, ok := errors.AsType[*insufficientCapacityError](handleZoneOperationError(op))
+	require.True(t, ok)
+	require.True(t, isQuotaExceeded(capacityErr.details))
+	require.Equal(t, "Quota 'N2_CPUS' exceeded. Limit: 24.0 in region us-central1.", capacityErr.details.message)
+}
+
+func TestExtractInsertInsufficientCapacityDetailsQuotaExceeded(t *testing.T) {
+	t.Parallel()
+
+	details, ok := extractInsertInsufficientCapacityDetails(&googleapi.Error{
+		Code:   http.StatusForbidden,
+		Errors: []googleapi.ErrorItem{{Reason: "quotaExceeded", Message: "Quota 'CPUS' exceeded. Limit: 8.0 in region us-central1."}},
+	})
+
+	require.True(t, ok)
+	require.True(t, isQuotaExceeded(details))
+	require.Equal(t, "quotaExceeded", details.structuredReason)
+}
+
+// API rate limits are reported as rateLimitExceeded and must not be treated as resource quota.
+func TestExtractInsertInsufficientCapacityDetailsIgnoresRateLimit(t *testing.T) {
+	t.Parallel()
+
+	_, ok := extractInsertInsufficientCapacityDetails(&googleapi.Error{
+		Code:   http.StatusForbidden,
+		Errors: []googleapi.ErrorItem{{Reason: "rateLimitExceeded"}},
+	})
+
+	require.False(t, ok)
+}
+
+func TestMarkQuotaExceededMarksAllZonesForCapacityType(t *testing.T) {
+	t.Parallel()
+
+	const ttl = 2 * time.Hour
+	ctx := options.ToContext(context.Background(), &options.Options{QuotaExceededTTL: ttl})
+	c := cache.New(unavailableofferings.DefaultTTL, unavailableofferings.CleanupInterval)
+	p := &DefaultProvider{unavailableOfferings: unavailableofferings.NewUnavailableOfferingsWithCache(c)}
+	offering := func(zone, capacityType string) *cloudprovider.Offering {
+		return &cloudprovider.Offering{Available: true, Requirements: scheduling.NewRequirements(
+			scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, zone),
+			scheduling.NewRequirement(karpv1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, capacityType),
+		)}
+	}
+	it := &cloudprovider.InstanceType{
+		Name: "n2-standard-4",
+		Offerings: cloudprovider.Offerings{
+			offering("us-central1-a", karpv1.CapacityTypeOnDemand),
+			offering("us-central1-b", karpv1.CapacityTypeOnDemand),
+			offering("us-central1-b", karpv1.CapacityTypeSpot),
+		},
+	}
+
+	err := p.markQuotaExceeded(ctx, it, "us-central1-a", karpv1.CapacityTypeOnDemand,
+		insufficientCapacityDetails{code: "QUOTA_EXCEEDED", message: "Quota 'N2_CPUS' exceeded."})
+
+	require.True(t, cloudprovider.IsInsufficientCapacityError(err))
+	require.ErrorContains(t, err, "n2-standard-4 on-demand/us-central1-a quota exceeded 2h0m0s")
+	requireStoredTTL(t, c, "n2-standard-4", "us-central1-a", karpv1.CapacityTypeOnDemand, ttl)
+	requireStoredTTL(t, c, "n2-standard-4", "us-central1-b", karpv1.CapacityTypeOnDemand, ttl)
+	_, found := c.Get(fmt.Sprintf("%s:%s:%s", karpv1.CapacityTypeSpot, "n2-standard-4", "us-central1-b"))
+	require.False(t, found, "spot quota is separate from on-demand quota")
+}
+
+// A zero TTL keeps the pre-quota behavior: the error is retryable within the
+// launch but no offering is marked unavailable.
+func TestGetOrCreateInstanceQuotaExceededDisabled(t *testing.T) {
+	t.Parallel()
+
+	p := newFakeComputeProvider(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.NotFound(w, r)
+			return
+		}
+		w.WriteHeader(http.StatusForbidden)
+		writeJSON(w, map[string]any{"error": map[string]any{"errors": []map[string]string{{"reason": "quotaExceeded"}}}})
+	}))
+	p.computeDefaultSA = "123-compute@developer.gserviceaccount.com"
+	c := cache.New(unavailableofferings.DefaultTTL, unavailableofferings.CleanupInterval)
+	p.unavailableOfferings = unavailableofferings.NewUnavailableOfferingsWithCache(c)
+	ctx := options.ToContext(context.Background(), &options.Options{QuotaExceededTTL: 0})
+
+	_, _, retryable, err := p.getOrCreateInstance(ctx, spotOrOnDemandNodeClaim(), &v1alpha1.GCENodeClass{}, makeNonGPUIT(),
+		makeSourceMetadata("max-pods-per-node=110"),
+		makeCluster("projects/p/global/networks/my-vpc", "regions/us-central1/subnetworks/my-subnet", "pods", false),
+		"us-central1-a", karpv1.CapacityTypeOnDemand, nil, nil, 0, nil)
+
+	require.Error(t, err)
+	require.False(t, cloudprovider.IsInsufficientCapacityError(err))
+	require.True(t, retryable)
+	require.Empty(t, c.Items())
+}
+
+type emptySubnetProvider struct{}
+
+func (emptySubnetProvider) GetFreeIPCounts(context.Context, string, string) (map[string]int64, error) {
+	return nil, nil
+}
+
+func (emptySubnetProvider) Invalidate(string, string) {}
+
+func TestGetOrCreateInstanceResourceNotReady(t *testing.T) {
+	t.Parallel()
+
+	p := newFakeComputeProvider(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.NotFound(w, r)
+			return
+		}
+		w.WriteHeader(http.StatusBadRequest)
+		writeJSON(w, map[string]any{"error": map[string]any{
+			"code":    http.StatusBadRequest,
+			"message": "The resource 'projects/gke-node-images/global/images/gke-1358-gke1900000-cos-125-19216-655-40-c-pre' is not ready",
+			"errors":  []map[string]string{{"reason": "resourceNotReady"}},
+		}})
+	}))
+	p.computeDefaultSA = "123-compute@developer.gserviceaccount.com"
+	c := cache.New(unavailableofferings.DefaultTTL, unavailableofferings.CleanupInterval)
+	p.unavailableOfferings = unavailableofferings.NewUnavailableOfferingsWithCache(c)
+
+	_, _, retryable, err := p.getOrCreateInstance(context.Background(), spotOrOnDemandNodeClaim(), &v1alpha1.GCENodeClass{}, makeNonGPUIT(),
+		makeSourceMetadata("max-pods-per-node=110"),
+		makeCluster("projects/p/global/networks/my-vpc", "regions/us-central1/subnetworks/my-subnet", "pods", false),
+		"us-central1-a", karpv1.CapacityTypeOnDemand, nil, nil, 0, nil)
+
+	require.Error(t, err)
+	require.False(t, retryable, "resourceNotReady must not fall through to the next instance type")
+	require.False(t, cloudprovider.IsInsufficientCapacityError(err), "resourceNotReady is not a capacity signal")
+	var createErr *cloudprovider.CreateError
+	require.ErrorAs(t, err, &createErr)
+	require.Equal(t, "ResourceNotReady", createErr.ConditionReason)
+	require.Empty(t, c.Items(), "the offering must not be marked unavailable")
+}
+
+func TestIsResourceNotReadyError(t *testing.T) {
+	t.Parallel()
+
+	require.True(t, isResourceNotReadyError(&googleapi.Error{Errors: []googleapi.ErrorItem{{Reason: "resourceNotReady"}}}))
+	require.True(t, isResourceNotReadyError(fmt.Errorf("wrapped: %w", &googleapi.Error{Errors: []googleapi.ErrorItem{{Reason: "resourceNotReady"}}})))
+	require.False(t, isResourceNotReadyError(&googleapi.Error{Message: "The resource is not ready"}))
+	require.False(t, isResourceNotReadyError(&googleapi.Error{Errors: []googleapi.ErrorItem{{Reason: "ZONE_RESOURCE_POOL_EXHAUSTED"}}}))
+	require.False(t, isResourceNotReadyError(fmt.Errorf("not a googleapi error")))
 }
 
 // newFakeComputeProvider builds a DefaultProvider whose computeService targets a fake
@@ -135,6 +534,8 @@ func newFakeComputeProvider(t *testing.T, handler http.Handler) *DefaultProvider
 		projectID:      "test-project",
 		region:         "us-central1",
 		computeService: svc,
+		subnetProvider: emptySubnetProvider{},
+		gkeProvider:    &fakeGKEProvider{},
 		instanceCache:  cache.New(instanceCacheExpiration, instanceCacheExpiration),
 	}
 }
@@ -163,7 +564,7 @@ func TestSetupInstanceMetadata_RebuildsLabelsAndTaintsFromTarget(t *testing.T) {
 		"addon.gke.io/node-local-dns-ds-ready=true,iam.gke.io/gke-metadata-server-enabled=true"
 	meta := &compute.Metadata{Items: []*compute.MetadataItems{
 		{Key: "kube-labels", Value: ptr.To(srcLabels)},
-		{Key: "kube-env", Value: ptr.To("KUBELET_ARGS: --v=2 --max-pods=110 --node-labels=" + srcLabels + " --register-with-taints=dedicated=karpenter:NoSchedule\n")},
+		{Key: "kube-env", Value: ptr.To(requiredSourceKubeEnv + "KUBELET_ARGS: --v=2 --max-pods=110 --node-labels=" + srcLabels + " --register-with-taints=dedicated=karpenter:NoSchedule\n")},
 		{Key: "kubelet-config", Value: ptr.To("maxPods: 110\n")},
 	}}
 	maxPods := int32(32)
@@ -181,7 +582,7 @@ func TestSetupInstanceMetadata_RebuildsLabelsAndTaintsFromTarget(t *testing.T) {
 		Overhead: &cloudprovider.InstanceTypeOverhead{KubeReserved: corev1.ResourceList{}},
 	}
 
-	patched, err := p.setupInstanceMetadata(context.Background(), meta, nodeClass, instanceType, nodeClaim, "europe-west4-c", karpv1.CapacityTypeOnDemand, false)
+	patched, err := p.setupInstanceMetadata(context.Background(), meta, nodeClass, instanceType, nodeClaim, "europe-west4-c", karpv1.CapacityTypeOnDemand, false, 0, 0)
 	require.NoError(t, err)
 
 	computeMetadata, err := patched.ToComputeMetadata()
@@ -655,12 +1056,108 @@ func TestRenderDiskProperties_NoProvisioningWhenFieldsAreNil(t *testing.T) {
 	p := &DefaultProvider{projectID: "my-project"}
 	nodeClass := bootDiskNodeClass("pd-ssd", nil, nil)
 
-	disks, err := p.renderDiskProperties(amd64InstanceType(), nodeClass, "us-central1-a")
+	disks, err := p.renderDiskProperties(amd64InstanceType(), spotOrOnDemandNodeClaim(), nodeClass, "us-central1-a", 0, nil)
 	require.NoError(t, err)
 
 	require.Len(t, disks, 1)
 	require.Zero(t, disks[0].InitializeParams.ProvisionedIops)
 	require.Zero(t, disks[0].InitializeParams.ProvisionedThroughput)
+}
+
+func TestRenderDiskProperties_DeviceName(t *testing.T) {
+	t.Parallel()
+
+	p := &DefaultProvider{projectID: "my-project"}
+	nodeClass := bootDiskNodeClass("hyperdisk-balanced", nil, nil)
+	nodeClass.Spec.Disks = append(nodeClass.Spec.Disks,
+		v1alpha1.Disk{SizeGiB: 3072, Category: "hyperdisk-balanced", DeviceName: "e2b-data"},
+		v1alpha1.Disk{SizeGiB: 20, Category: "pd-ssd"},
+		v1alpha1.Disk{SecondaryBootImage: "projects/project-a/global/images/cache-image", SecondaryBootMode: "CONTAINER_IMAGE_CACHE"},
+	)
+
+	disks, err := p.renderDiskProperties(amd64InstanceType(), spotOrOnDemandNodeClaim(), nodeClass, "us-central1-a", 0, nil)
+	require.NoError(t, err)
+	require.Len(t, disks, 4)
+
+	require.True(t, disks[0].Boot)
+	require.Empty(t, disks[0].DeviceName, "GCE names the boot disk")
+
+	require.Equal(t, "e2b-data", disks[1].DeviceName)
+	require.Empty(t, disks[1].InitializeParams.SourceImage, "a named data disk is blank")
+	require.Equal(t, int64(3072), disks[1].InitializeParams.DiskSizeGb)
+
+	require.Equal(t, "gke--disk", disks[2].DeviceName, "an unnamed data disk keeps the name it had before deviceName existed")
+
+	require.Equal(t, "gke-cache-image-disk", disks[3].DeviceName)
+	require.Equal(t, "projects/project-a/global/images/cache-image", disks[3].InitializeParams.SourceImage)
+}
+
+func TestRenderDiskProperties_InheritsNodeClassLabels(t *testing.T) {
+	t.Parallel()
+
+	p := &DefaultProvider{projectID: "my-project", clusterName: "my-cluster", clusterLocation: "us-central1"}
+	nodeClass := bootDiskNodeClass("pd-balanced", nil, nil)
+	nodeClass.Name = "test-nodeclass"
+	nodeClass.Spec.Labels = map[string]string{
+		"env":                         "dev",
+		utils.LabelClusterNameKey:     "wrong-cluster",
+		utils.LabelClusterLocationKey: "wrong-location",
+	}
+	nodeClass.Spec.Disks = append(nodeClass.Spec.Disks, v1alpha1.Disk{SizeGiB: 20, Category: "pd-ssd"})
+	nodeClaim := spotOrOnDemandNodeClaim()
+	nodeClaim.Labels = map[string]string{karpv1.NodePoolLabelKey: "test-pool"}
+
+	disks, err := p.renderDiskProperties(amd64InstanceType(), nodeClaim, nodeClass, "us-central1-a", 0, nil)
+	require.NoError(t, err)
+	require.Len(t, disks, 2)
+	wantLabels := map[string]string{
+		"env": "dev",
+		utils.SanitizeGCELabelValue(utils.LabelNodePoolKey):     "test-pool",
+		utils.SanitizeGCELabelValue(utils.LabelGCENodeClassKey): "test-nodeclass",
+		utils.LabelClusterNameKey:                               "my-cluster",
+		utils.LabelClusterLocationKey:                           "us-central1",
+	}
+	for _, disk := range disks {
+		require.Equal(t, wantLabels, disk.InitializeParams.Labels)
+	}
+	instance := &compute.Instance{Labels: make(map[string]string)}
+	p.setupInstanceLabels(instance, nodeClaim, nodeClass, "", 0)
+	for _, key := range []string{utils.LabelClusterNameKey, utils.LabelClusterLocationKey} {
+		require.Equal(t, instance.Labels[key], disks[0].InitializeParams.Labels[key])
+		require.Equal(t, instance.Labels[key], disks[1].InitializeParams.Labels[key])
+	}
+	require.Equal(t, "wrong-cluster", nodeClass.Spec.Labels[utils.LabelClusterNameKey])
+	require.Equal(t, "wrong-location", nodeClass.Spec.Labels[utils.LabelClusterLocationKey])
+
+	// Neither the NodeClass nor another disk's labels should change when one disk is modified.
+	disks[0].InitializeParams.Labels["env"] = "changed"
+	require.Equal(t, "dev", nodeClass.Spec.Labels["env"])
+	require.Equal(t, "dev", disks[1].InitializeParams.Labels["env"])
+
+	nodeClass.Spec.Labels = nil
+	disks, err = p.renderDiskProperties(amd64InstanceType(), nodeClaim, nodeClass, "us-central1-a", 0, nil)
+	require.NoError(t, err)
+	require.Equal(t, map[string]string{
+		utils.SanitizeGCELabelValue(utils.LabelNodePoolKey):     "test-pool",
+		utils.SanitizeGCELabelValue(utils.LabelGCENodeClassKey): "test-nodeclass",
+		utils.LabelClusterNameKey:                               "my-cluster",
+		utils.LabelClusterLocationKey:                           "us-central1",
+	}, disks[0].InitializeParams.Labels)
+	require.Equal(t, disks[0].InitializeParams.Labels, disks[1].InitializeParams.Labels)
+	require.Nil(t, p.scratchDisk("us-central1-a").InitializeParams.Labels)
+}
+
+func TestRenderDiskProperties_OmitsEmptyDiskCategory(t *testing.T) {
+	t.Parallel()
+
+	p := &DefaultProvider{projectID: "my-project"}
+	nodeClass := bootDiskNodeClass("", nil, nil)
+
+	disks, err := p.renderDiskProperties(amd64InstanceType(), spotOrOnDemandNodeClaim(), nodeClass, "us-central1-a", 0, nil)
+	require.NoError(t, err)
+
+	require.Len(t, disks, 1)
+	require.Empty(t, disks[0].InitializeParams.DiskType)
 }
 
 func TestRenderDiskProperties_SetsProvisionedIOPS(t *testing.T) {
@@ -669,7 +1166,7 @@ func TestRenderDiskProperties_SetsProvisionedIOPS(t *testing.T) {
 	p := &DefaultProvider{projectID: "my-project"}
 	nodeClass := bootDiskNodeClass("pd-extreme", ptr.To(int64(5000)), nil)
 
-	disks, err := p.renderDiskProperties(amd64InstanceType(), nodeClass, "us-central1-a")
+	disks, err := p.renderDiskProperties(amd64InstanceType(), spotOrOnDemandNodeClaim(), nodeClass, "us-central1-a", 0, nil)
 	require.NoError(t, err)
 
 	require.Len(t, disks, 1)
@@ -683,7 +1180,7 @@ func TestRenderDiskProperties_SetsProvisionedThroughput(t *testing.T) {
 	p := &DefaultProvider{projectID: "my-project"}
 	nodeClass := bootDiskNodeClass("hyperdisk-throughput", nil, ptr.To(int64(500)))
 
-	disks, err := p.renderDiskProperties(amd64InstanceType(), nodeClass, "us-central1-a")
+	disks, err := p.renderDiskProperties(amd64InstanceType(), spotOrOnDemandNodeClaim(), nodeClass, "us-central1-a", 0, nil)
 	require.NoError(t, err)
 
 	require.Len(t, disks, 1)
@@ -697,12 +1194,75 @@ func TestRenderDiskProperties_SetsBothIOPSAndThroughput(t *testing.T) {
 	p := &DefaultProvider{projectID: "my-project"}
 	nodeClass := bootDiskNodeClass("hyperdisk-balanced", ptr.To(int64(10000)), ptr.To(int64(400)))
 
-	disks, err := p.renderDiskProperties(amd64InstanceType(), nodeClass, "us-central1-a")
+	disks, err := p.renderDiskProperties(amd64InstanceType(), spotOrOnDemandNodeClaim(), nodeClass, "us-central1-a", 0, nil)
 	require.NoError(t, err)
 
 	require.Len(t, disks, 1)
 	require.Equal(t, int64(10000), disks[0].InitializeParams.ProvisionedIops)
 	require.Equal(t, int64(400), disks[0].InitializeParams.ProvisionedThroughput)
+}
+
+func countScratch(disks []*compute.AttachedDisk) int {
+	n := 0
+	for _, d := range disks {
+		if d.Type == "SCRATCH" && d.Interface == "NVME" &&
+			d.InitializeParams != nil && d.InitializeParams.DiskSizeGb == 0 &&
+			strings.HasSuffix(d.InitializeParams.DiskType, "/diskTypes/local-ssd") {
+			n++
+		}
+	}
+	return n
+}
+
+func TestRenderDiskProperties_SsdCountEmitsScratchDisks(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name             string
+		instanceTypeName string
+		ssdCount         int
+		legacyEntries    int
+		wantScratchCount int
+	}{
+		{name: "no SSDs at all", instanceTypeName: "n2d-standard-8", ssdCount: 0, legacyEntries: 0, wantScratchCount: 0},
+		{name: "configurable family ssdCount=2", instanceTypeName: "n2d-standard-8", ssdCount: 2, legacyEntries: 0, wantScratchCount: 2},
+		{name: "ssdCount=0 with 2 legacy entries → still 0 (legacy ignored)", instanceTypeName: "n2d-standard-8", ssdCount: 0, legacyEntries: 2, wantScratchCount: 0},
+		{name: "ssdCount=3 with 1 legacy entry → 3 (legacy ignored)", instanceTypeName: "n2d-standard-8", ssdCount: 3, legacyEntries: 1, wantScratchCount: 3},
+		{name: "bundled SKU never gets explicit SCRATCH", instanceTypeName: "z3-highmem-88-highlssd", ssdCount: 12, legacyEntries: 0, wantScratchCount: 0},
+		{name: "z4d bundled SSD is auto-attached", instanceTypeName: "z4d-highmem-8-highlssd", ssdCount: 1, legacyEntries: 0, wantScratchCount: 0},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			nc := &v1alpha1.GCENodeClass{
+				Spec: v1alpha1.GCENodeClassSpec{
+					Disks: []v1alpha1.Disk{
+						{Boot: true, SizeGiB: 50, Category: "pd-balanced"},
+					},
+				},
+				Status: v1alpha1.GCENodeClassStatus{
+					Images: []v1alpha1.Image{{
+						SourceImage: "projects/my-project/global/images/my-image",
+						Requirements: []corev1.NodeSelectorRequirement{{
+							Key: corev1.LabelArchStable, Operator: corev1.NodeSelectorOpIn, Values: []string{"amd64"},
+						}},
+					}},
+				},
+			}
+			for i := 0; i < tc.legacyEntries; i++ {
+				nc.Spec.Disks = append(nc.Spec.Disks, v1alpha1.Disk{Category: "local-ssd"})
+			}
+
+			it := amd64InstanceType()
+			it.Name = tc.instanceTypeName
+			p := &DefaultProvider{projectID: "my-project"}
+			disks, err := p.renderDiskProperties(it, spotOrOnDemandNodeClaim(), nc, "us-central1-a", tc.ssdCount, nil)
+			require.NoError(t, err)
+			require.Equal(t, tc.wantScratchCount, countScratch(disks),
+				"expected %d SCRATCH local-SSD disks", tc.wantScratchCount)
+		})
+	}
 }
 
 func TestRenderDiskProperties_MultipleDisksSetProvisioningIndependently(t *testing.T) {
@@ -741,7 +1301,7 @@ func TestRenderDiskProperties_MultipleDisksSetProvisioningIndependently(t *testi
 		},
 	}
 
-	disks, err := p.renderDiskProperties(amd64InstanceType(), nodeClass, "us-central1-a")
+	disks, err := p.renderDiskProperties(amd64InstanceType(), spotOrOnDemandNodeClaim(), nodeClass, "us-central1-a", 0, nil)
 	require.NoError(t, err)
 
 	require.Len(t, disks, 2)
@@ -868,17 +1428,34 @@ func TestSetupNetworkInterfaces(t *testing.T) {
 		require.Equal(t, "cluster-pods-range", result[0].AliasIpRanges[0].SubnetworkRangeName)
 	})
 
-	t.Run("NodeClass SubnetRangeName overrides cluster pod range", func(t *testing.T) {
+	t.Run("NodeClass SubnetRangeNames overrides cluster pod range", func(t *testing.T) {
 		t.Parallel()
 
-		name := "custom-pods"
 		nodeClass := &v1alpha1.GCENodeClass{
-			Spec: v1alpha1.GCENodeClassSpec{SubnetRangeName: &name},
+			Spec: v1alpha1.GCENodeClassSpec{SubnetRangeNames: []string{"custom-pods"}},
 		}
 		cluster := makeCluster("net", "subnet", "cluster-pods-range", false)
 		result := p.setupNetworkInterfaces(cluster, nodeClass)
 
 		require.Equal(t, "custom-pods", result[0].AliasIpRanges[0].SubnetworkRangeName)
+	})
+
+	t.Run("NodeClass SubnetRangeNames sets the first candidate before launch ranking", func(t *testing.T) {
+		t.Parallel()
+
+		nodeClass := &v1alpha1.GCENodeClass{
+			Spec: v1alpha1.GCENodeClassSpec{SubnetRangeNames: []string{"full-pods", "free-pods"}},
+		}
+		cluster := makeCluster("net", "subnet", "cluster-pods-range", false)
+		cluster.IpAllocationPolicy.AdditionalPodRangesConfig = &containerv1.AdditionalPodRangesConfig{
+			PodRangeInfo: []*containerv1.RangeInfo{
+				{RangeName: "full-pods", Utilization: 0.95},
+				{RangeName: "free-pods", Utilization: 0.1},
+			},
+		}
+		result := p.setupNetworkInterfaces(cluster, nodeClass)
+
+		require.Equal(t, "full-pods", result[0].AliasIpRanges[0].SubnetworkRangeName)
 	})
 
 	t.Run("CIDR prefix derived from maxPods", func(t *testing.T) {
@@ -923,6 +1500,48 @@ func TestSetupNetworkInterfaces_AdditionalInterfaceWithSubnetwork(t *testing.T) 
 	// Public cluster: secondary interface also gets ONE_TO_ONE_NAT.
 	require.Len(t, result[1].AccessConfigs, 1)
 	require.Equal(t, "ONE_TO_ONE_NAT", result[1].AccessConfigs[0].Type)
+}
+
+func TestSetupNetworkInterfaces_GVNIC(t *testing.T) {
+	t.Parallel()
+
+	for _, additional := range []bool{false, true} {
+		t.Run(fmt.Sprintf("additional interface %t", additional), func(t *testing.T) {
+			t.Parallel()
+
+			for _, tc := range []struct {
+				name  string
+				gvnic *v1alpha1.VirtualNIC
+				want  string
+			}{
+				{name: "absent leaves the type to GCE"},
+				{name: "enabled", gvnic: &v1alpha1.VirtualNIC{Enabled: true}, want: "GVNIC"},
+				{name: "disabled", gvnic: &v1alpha1.VirtualNIC{Enabled: false}, want: "VIRTIO_NET"},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					t.Parallel()
+
+					nodeClass := &v1alpha1.GCENodeClass{Spec: v1alpha1.GCENodeClassSpec{GVNIC: tc.gvnic}}
+					wantCount := 1
+					if additional {
+						nodeClass.Spec.NetworkConfig = &v1alpha1.NetworkConfig{
+							AdditionalNetworkInterfaces: []v1alpha1.AdditionalNetworkInterface{
+								{Subnetwork: "regions/us-central1/subnetworks/secondary"},
+							},
+						}
+						wantCount++
+					}
+					p := &DefaultProvider{}
+					result := p.setupNetworkInterfaces(makeCluster("net", "subnet", "pods", false), nodeClass)
+
+					require.Len(t, result, wantCount)
+					for i, iface := range result {
+						require.Equal(t, tc.want, iface.NicType, "interface %d", i)
+					}
+				})
+			}
+		})
+	}
 }
 
 func TestSetupNetworkInterfaces_AdditionalInterfaceNetworkOverride(t *testing.T) {
@@ -999,15 +1618,51 @@ func TestSetupScheduling(t *testing.T) {
 
 	t.Run("spot sets termination action", func(t *testing.T) {
 		t.Parallel()
-		sched := setupScheduling(karpv1.CapacityTypeSpot)
+		sched := setupScheduling(karpv1.CapacityTypeSpot, &v1alpha1.GCENodeClass{})
 		require.Equal(t, instanceTerminationActionDelete, sched.InstanceTerminationAction)
 	})
 
 	t.Run("on-demand leaves termination action empty", func(t *testing.T) {
 		t.Parallel()
-		sched := setupScheduling(karpv1.CapacityTypeOnDemand)
+		sched := setupScheduling(karpv1.CapacityTypeOnDemand, &v1alpha1.GCENodeClass{})
 		require.Empty(t, sched.InstanceTerminationAction)
 	})
+}
+
+func TestSetupSchedulingPreemptionNoticeDuration(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name            string
+		capacityType    string
+		noticeDuration  *metav1.Duration
+		expectedSeconds int64
+	}{
+		{name: "spot unset leaves notice duration nil", capacityType: karpv1.CapacityTypeSpot},
+		{name: "spot zero leaves notice duration nil", capacityType: karpv1.CapacityTypeSpot, noticeDuration: &metav1.Duration{Duration: 0}},
+		{name: "spot 120s sets a two-minute notice", capacityType: karpv1.CapacityTypeSpot, noticeDuration: &metav1.Duration{Duration: 120 * time.Second}, expectedSeconds: 120},
+		{name: "spot 2m sets the same notice as 120s", capacityType: karpv1.CapacityTypeSpot, noticeDuration: &metav1.Duration{Duration: 2 * time.Minute}, expectedSeconds: 120},
+		{name: "spot 90s is passed through unrounded", capacityType: karpv1.CapacityTypeSpot, noticeDuration: &metav1.Duration{Duration: 90 * time.Second}, expectedSeconds: 90},
+		{name: "on-demand ignores notice duration", capacityType: karpv1.CapacityTypeOnDemand, noticeDuration: &metav1.Duration{Duration: 120 * time.Second}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			nc := &v1alpha1.GCENodeClass{}
+			nc.Spec.PreemptionNoticeDuration = tc.noticeDuration
+
+			sched := setupScheduling(tc.capacityType, nc)
+
+			if tc.expectedSeconds == 0 {
+				require.Nil(t, sched.PreemptionNoticeDuration)
+				return
+			}
+			require.NotNil(t, sched.PreemptionNoticeDuration)
+			require.Equal(t, tc.expectedSeconds, sched.PreemptionNoticeDuration.Seconds)
+		})
+	}
 }
 
 func spotOrOnDemandNodeClaim() *karpv1.NodeClaim {
@@ -1113,6 +1768,250 @@ func TestGetCapacityType(t *testing.T) {
 	}
 }
 
+type fakeInstanceTypeProvider struct {
+	instancetype.Provider
+}
+
+func (fakeInstanceTypeProvider) GetMachineType(string) *computepb.MachineType { return nil }
+
+type fakeNodePoolTemplateProvider struct {
+	nodepooltemplate.Provider
+}
+
+func (fakeNodePoolTemplateProvider) GetSourceTemplateMetadata(context.Context) (*compute.Metadata, error) {
+	return makeSourceMetadata("max-pods-per-node=110"), nil
+}
+
+type fakeClusterGKEProvider struct {
+	fakeGKEProvider
+}
+
+func (f *fakeClusterGKEProvider) GetClusterConfig(context.Context) (*containerv1.Cluster, error) {
+	return makeCluster("projects/p/global/networks/my-vpc", "regions/us-central1/subnetworks/my-subnet", "pods", false), nil
+}
+
+// newFakeCreateProvider returns a provider whose fake GCE API rejects an insert with the
+// reason insertError returns for its instance type and capacity type, and accepts it when
+// the reason is empty. It records each insert as "<instance type>/<capacity type>".
+func newFakeCreateProvider(t *testing.T, insertError func(instanceType, capacityType string) string) (*DefaultProvider, *cache.Cache, func() []string) {
+	t.Helper()
+	var mu sync.Mutex
+	var inserts []string
+	p := newFakeComputeProvider(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost:
+			var inst compute.Instance
+			if err := json.NewDecoder(r.Body).Decode(&inst); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			instanceType, capacityType := lastPathSegment(inst.MachineType), resolveCapacityType(inst.Scheduling)
+			mu.Lock()
+			inserts = append(inserts, instanceType+"/"+capacityType)
+			mu.Unlock()
+			if reason := insertError(instanceType, capacityType); reason != "" {
+				w.WriteHeader(http.StatusBadRequest)
+				writeJSON(w, map[string]any{"error": map[string]any{"errors": []map[string]string{{"reason": reason}}}})
+				return
+			}
+			writeJSON(w, map[string]any{"name": "op-1", "status": "DONE"})
+		case strings.Contains(r.URL.Path, "/operations/"):
+			writeJSON(w, map[string]any{"name": "op-1", "status": "DONE"})
+		case strings.HasSuffix(r.URL.Path, "/aggregated/instances"):
+			writeJSON(w, map[string]any{})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	c := useFakeCreateDependencies(p, "us-central1-a")
+	return p, c, func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Clone(inserts)
+	}
+}
+
+func useFakeCreateDependencies(p *DefaultProvider, zones ...string) *cache.Cache {
+	p.computeDefaultSA = "123-compute@developer.gserviceaccount.com"
+	p.gkeProvider = &fakeClusterGKEProvider{fakeGKEProvider{zones: zones}}
+	p.instanceTypeProvider = fakeInstanceTypeProvider{}
+	p.nodePoolTemplateProvider = fakeNodePoolTemplateProvider{}
+	c := cache.New(unavailableofferings.DefaultTTL, unavailableofferings.CleanupInterval)
+	p.unavailableOfferings = unavailableofferings.NewUnavailableOfferingsWithCache(c)
+	return c
+}
+
+func spotAndOnDemandIT(name string, spotPrice, onDemandPrice float64) *cloudprovider.InstanceType {
+	offering := func(capacityType string, price float64) *cloudprovider.Offering {
+		return &cloudprovider.Offering{
+			Available: true,
+			Price:     price,
+			Requirements: scheduling.NewRequirements(
+				scheduling.NewRequirement(karpv1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, capacityType),
+				scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, "us-central1-a"),
+			),
+		}
+	}
+	it := makeNonGPUIT()
+	it.Name = name
+	it.Offerings = cloudprovider.Offerings{offering(karpv1.CapacityTypeSpot, spotPrice), offering(karpv1.CapacityTypeOnDemand, onDemandPrice)}
+	it.Requirements.Add(scheduling.NewRequirement(v1alpha1.LabelInstanceLocalSsdCount, corev1.NodeSelectorOpIn, "0"))
+	return it
+}
+
+func imagesReadyNodeClass() *v1alpha1.GCENodeClass {
+	nodeClass := &v1alpha1.GCENodeClass{}
+	nodeClass.Status.Images = []v1alpha1.Image{{
+		SourceImage:  "projects/gke-node-images/global/images/gke-cos",
+		Requirements: []corev1.NodeSelectorRequirement{{Key: corev1.LabelArchStable, Operator: corev1.NodeSelectorOpIn, Values: []string{"amd64"}}},
+	}}
+	nodeClass.StatusConditions().SetTrue(v1alpha1.ConditionTypeImagesReady)
+	return nodeClass
+}
+
+func spotStockout(onDemandError string) func(string, string) string {
+	return func(_, capacityType string) string {
+		if capacityType == karpv1.CapacityTypeSpot {
+			return "ZONE_RESOURCE_POOL_EXHAUSTED"
+		}
+		return onDemandError
+	}
+}
+
+func TestCreate_FallsBackToOnDemandAfterSpotStockout(t *testing.T) {
+	t.Parallel()
+
+	p, c, inserts := newFakeCreateProvider(t, spotStockout(""))
+	nodeClaim := spotOrOnDemandNodeClaim()
+	nodeClaim.Name = "fallback"
+
+	instance, err := p.Create(context.Background(), imagesReadyNodeClass(), nodeClaim, []*cloudprovider.InstanceType{spotAndOnDemandIT("n2-standard-4", 0.05, 0.2)})
+
+	require.NoError(t, err)
+	require.Equal(t, karpv1.CapacityTypeOnDemand, instance.CapacityType)
+	require.Equal(t, []string{"n2-standard-4/spot", "n2-standard-4/on-demand"}, inserts())
+	requireStoredTTL(t, c, "n2-standard-4", "us-central1-a", karpv1.CapacityTypeSpot, options.DefaultStockoutTTL)
+}
+
+func TestCreate_FallbackOrdersInstanceTypesByOnDemandPrice(t *testing.T) {
+	t.Parallel()
+
+	p, _, inserts := newFakeCreateProvider(t, spotStockout(""))
+	nodeClaim := spotOrOnDemandNodeClaim()
+	nodeClaim.Name = "reorder"
+
+	instance, err := p.Create(context.Background(), imagesReadyNodeClass(), nodeClaim, []*cloudprovider.InstanceType{
+		spotAndOnDemandIT("n2-standard-4", 0.05, 0.5), spotAndOnDemandIT("n2-standard-8", 0.06, 0.3),
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, "n2-standard-8", instance.Type)
+	require.Equal(t, []string{"n2-standard-4/spot", "n2-standard-8/spot", "n2-standard-8/on-demand"}, inserts())
+}
+
+func TestCreate_SpotOnlyNodeClaimDoesNotFallBackToOnDemand(t *testing.T) {
+	t.Parallel()
+
+	p, _, inserts := newFakeCreateProvider(t, spotStockout(""))
+	nodeClaim := spotOrOnDemandNodeClaim()
+	nodeClaim.Name = "spot-only"
+	nodeClaim.Spec.Requirements[0].Values = []string{karpv1.CapacityTypeSpot}
+
+	_, err := p.Create(context.Background(), imagesReadyNodeClass(), nodeClaim, []*cloudprovider.InstanceType{spotAndOnDemandIT("n2-standard-4", 0.05, 0.2)})
+
+	require.True(t, cloudprovider.IsInsufficientCapacityError(err))
+	require.Equal(t, []string{"n2-standard-4/spot"}, inserts())
+}
+
+func TestCreate_DoesNotFallBackWhenASpotFailureIsNotCapacity(t *testing.T) {
+	t.Parallel()
+
+	p, _, inserts := newFakeCreateProvider(t, func(instanceType, capacityType string) string {
+		if capacityType != karpv1.CapacityTypeSpot {
+			return ""
+		}
+		if instanceType == "n2-standard-4" {
+			return "ZONE_RESOURCE_POOL_EXHAUSTED"
+		}
+		return "internalError"
+	})
+	nodeClaim := spotOrOnDemandNodeClaim()
+	nodeClaim.Name = "mixed"
+
+	_, err := p.Create(context.Background(), imagesReadyNodeClass(), nodeClaim, []*cloudprovider.InstanceType{
+		spotAndOnDemandIT("n2-standard-4", 0.05, 0.2), spotAndOnDemandIT("n2-standard-8", 0.1, 0.4),
+	})
+
+	require.Error(t, err)
+	require.Equal(t, []string{"n2-standard-4/spot", "n2-standard-8/spot"}, inserts())
+}
+
+func TestCreate_OnDemandFallbackFailureIsNotReportedAsSpotCapacity(t *testing.T) {
+	t.Parallel()
+
+	p, _, inserts := newFakeCreateProvider(t, spotStockout("internalError"))
+	nodeClaim := spotOrOnDemandNodeClaim()
+	nodeClaim.Name = "fallback-fails"
+
+	_, err := p.Create(context.Background(), imagesReadyNodeClass(), nodeClaim, []*cloudprovider.InstanceType{spotAndOnDemandIT("n2-standard-4", 0.05, 0.2)})
+
+	require.Error(t, err)
+	require.False(t, cloudprovider.IsInsufficientCapacityError(err), "core must retry the NodeClaim, not delete it for spot capacity")
+	require.Equal(t, []string{"n2-standard-4/spot", "n2-standard-4/on-demand"}, inserts())
+}
+
+func TestCreate_FallbackAdoptsSpotInstanceLeftByStockedOutInsert(t *testing.T) {
+	t.Parallel()
+
+	var mu sync.Mutex
+	var leftover *compute.Instance
+	inserts := 0
+	p := newFakeComputeProvider(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch {
+		case r.Method == http.MethodPost:
+			inserts++
+			leftover = &compute.Instance{}
+			if err := json.NewDecoder(r.Body).Decode(leftover); err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			writeJSON(w, map[string]any{"name": "op-1", "status": "RUNNING"})
+		case strings.Contains(r.URL.Path, "/operations/"):
+			writeJSON(w, map[string]any{"name": "op-1", "status": "DONE", "error": map[string]any{
+				"errors": []map[string]string{{"code": "ZONE_RESOURCE_POOL_EXHAUSTED"}},
+			}})
+		case strings.HasSuffix(r.URL.Path, "/zones/us-central1-a/instances/karpenter-leftover") && leftover != nil:
+			writeJSON(w, leftover)
+		case strings.HasSuffix(r.URL.Path, "/aggregated/instances"):
+			writeJSON(w, map[string]any{})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	useFakeCreateDependencies(p, "us-central1-a", "us-central1-b")
+	p.unavailableOfferings.MarkUnavailable(context.Background(), "test", "n2-standard-4", "us-central1-a", karpv1.CapacityTypeOnDemand)
+	it := spotAndOnDemandIT("n2-standard-4", 0.05, 0.2)
+	it.Offerings = append(it.Offerings, &cloudprovider.Offering{
+		Available: true,
+		Price:     0.2,
+		Requirements: scheduling.NewRequirements(
+			scheduling.NewRequirement(karpv1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, karpv1.CapacityTypeOnDemand),
+			scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, "us-central1-b"),
+		),
+	})
+	nodeClaim := spotOrOnDemandNodeClaim()
+	nodeClaim.Name = "leftover"
+
+	instance, err := p.Create(context.Background(), imagesReadyNodeClass(), nodeClaim, []*cloudprovider.InstanceType{it})
+
+	require.NoError(t, err)
+	require.Equal(t, 1, inserts, "the on-demand pass must adopt the leftover spot VM instead of inserting a second one")
+	require.Equal(t, "us-central1-a", instance.Location)
+	require.Equal(t, karpv1.CapacityTypeSpot, instance.CapacityType)
+}
+
 func TestBuildInstance_UsesExternalCapacityTypeNotRecomputed(t *testing.T) {
 	t.Parallel()
 
@@ -1134,7 +2033,7 @@ func TestBuildInstance_UsesExternalCapacityTypeNotRecomputed(t *testing.T) {
 
 	sourceMetadata := computeMetadataValues(map[string]string{
 		metadata.KubeLabelsKey:    "max-pods-per-node=110,max-pods=110",
-		metadata.KubeEnvKey:       "KUBELET_ARGS: --max-pods=110 --node-labels=max-pods-per-node=110,max-pods=110\narch=amd64\n",
+		metadata.KubeEnvKey:       requiredSourceKubeEnv + "KUBELET_ARGS: --max-pods=110 --node-labels=max-pods-per-node=110,max-pods=110\narch=amd64\n",
 		metadata.KubeletConfigKey: "nodeStatusUpdateFrequency: 10s\n",
 	})
 
@@ -1148,6 +2047,7 @@ func TestBuildInstance_UsesExternalCapacityTypeNotRecomputed(t *testing.T) {
 		cluster,
 		"us-central1-a", "karpenter-test",
 		karpv1.CapacityTypeSpot, // externally decided by Create() — must not be recomputed
+		nil, 0, "pods",
 	)
 	require.NoError(t, err)
 
@@ -1209,7 +2109,7 @@ func TestBuildInstance_GPUTaintInjected(t *testing.T) {
 
 	sourceMetadata := computeMetadataValues(map[string]string{
 		metadata.KubeLabelsKey:    "max-pods-per-node=110,max-pods=110",
-		metadata.KubeEnvKey:       "KUBELET_ARGS: --max-pods=110 --node-labels=max-pods-per-node=110,max-pods=110\ngke-provisioning=standard\n",
+		metadata.KubeEnvKey:       requiredSourceKubeEnv + "KUBELET_ARGS: --max-pods=110 --node-labels=max-pods-per-node=110,max-pods=110\ngke-provisioning=standard\n",
 		metadata.KubeletConfigKey: "nodeStatusUpdateFrequency: 10s\n",
 	})
 
@@ -1224,6 +2124,7 @@ func TestBuildInstance_GPUTaintInjected(t *testing.T) {
 		cluster,
 		"us-central1-a", "karpenter-gpu-test",
 		karpv1.CapacityTypeOnDemand,
+		nil, 0, "pods",
 	)
 
 	require.NoError(t, err)
@@ -1263,7 +2164,7 @@ func TestBuildInstance_GPUTaintNotInjectedWhenDisabled(t *testing.T) {
 
 	sourceMetadata := computeMetadataValues(map[string]string{
 		metadata.KubeLabelsKey:    "max-pods-per-node=110,max-pods=110",
-		metadata.KubeEnvKey:       "KUBELET_ARGS: --max-pods=110 --node-labels=max-pods-per-node=110,max-pods=110\ngke-provisioning=standard\n",
+		metadata.KubeEnvKey:       requiredSourceKubeEnv + "KUBELET_ARGS: --max-pods=110 --node-labels=max-pods-per-node=110,max-pods=110\ngke-provisioning=standard\n",
 		metadata.KubeletConfigKey: "nodeStatusUpdateFrequency: 10s\n",
 	})
 
@@ -1278,6 +2179,7 @@ func TestBuildInstance_GPUTaintNotInjectedWhenDisabled(t *testing.T) {
 		cluster,
 		"us-central1-a", "karpenter-gpu-test",
 		karpv1.CapacityTypeOnDemand,
+		nil, 0, "pods",
 	)
 
 	require.NoError(t, err)
@@ -1326,10 +2228,20 @@ func makeGPUIT() *cloudprovider.InstanceType {
 	}
 }
 
+// requiredSourceKubeEnv holds the kube-env entries that validateSourceKubeEnv
+// requires in every source template.
+// requiredSourceKubeEnv is the kube-env subset that every source template must
+// have. The archive URLs are fixtures and are never fetched by these tests.
+const requiredSourceKubeEnv = "CA_CERT: test-ca\n" +
+	"KUBE_MANIFESTS_TAR_URL: https://storage.googleapis.com/gke-release/kubernetes/release/v1.35.8-gke.1796000/kubernetes-manifests.tar.gz\n" +
+	"KUBERNETES_MASTER_NAME: 10.0.0.2\n" +
+	"SERVER_BINARY_TAR_HASH: amd64-sha512\n" +
+	"SERVER_BINARY_TAR_URL: https://storage.googleapis.com/gke-release/kubernetes/release/v1.35.8-gke.1796000/kubernetes-server-linux-amd64.tar.gz\n"
+
 func makeSourceMetadata(kubeLabels string) *compute.Metadata {
 	return computeMetadataValues(map[string]string{
 		metadata.KubeLabelsKey:    kubeLabels,
-		metadata.KubeEnvKey:       "KUBELET_ARGS: --max-pods=110 --node-labels=" + kubeLabels + "\ngke-provisioning=standard\n",
+		metadata.KubeEnvKey:       requiredSourceKubeEnv + "KUBELET_ARGS: --max-pods=110 --node-labels=" + kubeLabels + "\ngke-provisioning=standard\n",
 		metadata.KubeletConfigKey: "nodeStatusUpdateFrequency: 10s\n",
 	})
 }
@@ -1383,6 +2295,7 @@ func TestBuildInstance_SortsMetadataAfterAllPatches(t *testing.T) {
 		makeCluster("projects/p/global/networks/my-vpc", "regions/us-central1/subnetworks/my-subnet", "pods", false),
 		"us-central1-a", "karpenter-sort-test",
 		karpv1.CapacityTypeOnDemand,
+		nil, 0, "pods",
 	)
 	require.NoError(t, err)
 
@@ -1390,6 +2303,50 @@ func TestBuildInstance_SortsMetadataAfterAllPatches(t *testing.T) {
 	want := append([]string(nil), got...)
 	sort.Strings(want)
 	require.Equal(t, want, got)
+}
+
+func TestBuildInstance_ResourceManagerTags(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		tags map[string]v1alpha1.ResourceManagerTagValue
+		want *compute.InstanceParams
+	}{
+		{
+			name: "unset leaves Params nil",
+			tags: nil,
+			want: nil,
+		},
+		{
+			name: "passes numeric and namespaced tags through to Params",
+			tags: map[string]v1alpha1.ResourceManagerTagValue{
+				"tagKeys/123":         "tagValues/456",
+				"my-project/firewall": "allow-ingress",
+			},
+			want: &compute.InstanceParams{ResourceManagerTags: map[string]string{
+				"tagKeys/123":         "tagValues/456",
+				"my-project/firewall": "allow-ingress",
+			}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			nodeClass := &v1alpha1.GCENodeClass{Spec: v1alpha1.GCENodeClassSpec{ResourceManagerTags: tt.tags}}
+			instance, err := makeProvider().buildInstance(
+				context.Background(),
+				spotOrOnDemandNodeClaim(), nodeClass, makeNonGPUIT(), makeSourceMetadata("max-pods-per-node=110,max-pods=110"),
+				makeCluster("projects/p/global/networks/my-vpc", "regions/us-central1/subnetworks/my-subnet", "pods", false),
+				"us-central1-a", "karpenter-rmtags-test",
+				karpv1.CapacityTypeOnDemand,
+				nil, 0, "pods",
+			)
+			require.NoError(t, err)
+			require.Equal(t, tt.want, instance.Params)
+		})
+	}
 }
 
 func TestBuildInstance_DiskTypeLabels(t *testing.T) {
@@ -1424,6 +2381,7 @@ func TestBuildInstance_DiskTypeLabels(t *testing.T) {
 		cluster,
 		"us-central1-a", "karpenter-disk-label-test",
 		karpv1.CapacityTypeOnDemand,
+		nil, 0, "pods",
 	)
 
 	require.NoError(t, err)
@@ -1449,6 +2407,7 @@ func TestBuildInstance_RebuildsGCELabelsWithoutTemplateIdentityLabelInheritance(
 		makeCluster("net", "subnet", "pods", false),
 		"us-central1-a", "karpenter-identity-test",
 		karpv1.CapacityTypeOnDemand,
+		nil, 0, "pods",
 	)
 
 	require.NoError(t, err)
@@ -1491,6 +2450,7 @@ func TestBuildInstance_GPUDriverVersionLabel(t *testing.T) {
 				makeCluster("net", "subnet", "pods", false),
 				"us-central1-a", "karpenter-gpu-test",
 				karpv1.CapacityTypeOnDemand,
+				nil, 0, "pods",
 			)
 			require.NoError(t, err)
 			kl := kubeLabelsFrom(t, instance)
@@ -1537,6 +2497,7 @@ func TestBuildInstance_GPUDriverVersionNotInjectedForNonGPU(t *testing.T) {
 		makeCluster("net", "subnet", "pods", false),
 		"us-central1-a", "karpenter-test",
 		karpv1.CapacityTypeOnDemand,
+		nil, 0, "pods",
 	)
 	require.NoError(t, err)
 	got := kubeLabelsFrom(t, instance)
@@ -1558,6 +2519,7 @@ func TestBuildInstance_GPUDriverVersionOverridesTemplate(t *testing.T) {
 		makeCluster("net", "subnet", "pods", false),
 		"us-central1-a", "karpenter-gpu-test",
 		karpv1.CapacityTypeOnDemand,
+		nil, 0, "pods",
 	)
 	require.NoError(t, err)
 	got := kubeLabelsFrom(t, instance)
@@ -1594,6 +2556,7 @@ func TestBuildInstance_NodePoolLabelDoesNotOverrideGPUDriverAtBootTime(t *testin
 		makeCluster("net", "subnet", "pods", false),
 		"us-central1-a", "karpenter-gpu-test",
 		karpv1.CapacityTypeOnDemand,
+		nil, 0, "pods",
 	)
 	require.NoError(t, err)
 	got := kubeLabelsFrom(t, instance)
@@ -1621,11 +2584,26 @@ func TestSetupInstanceLabels_StampsClusterLocation(t *testing.T) {
 	p := &DefaultProvider{clusterName: "my-cluster", clusterLocation: "us-central1-f"}
 	inst, nodeClaim, nodeClass := instanceLabelsFixture()
 
-	p.setupInstanceLabels(inst, nodeClaim, nodeClass, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+	p.setupInstanceLabels(inst, nodeClaim, nodeClass, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", 0)
 
 	locationKey := utils.SanitizeGCELabelValue(utils.LabelClusterLocationKey)
 	require.Equal(t, "us-central1-f", inst.Labels[locationKey],
 		"cluster location must be stamped on the instance label %q", locationKey)
+}
+
+func TestSetupInstanceLabels_StampsLocalSSDCount(t *testing.T) {
+	t.Parallel()
+
+	countKey := utils.SanitizeGCELabelValue(v1alpha1.LabelInstanceLocalSsdCount)
+	for _, count := range []int{0, 4} {
+		p := &DefaultProvider{clusterName: "my-cluster", clusterLocation: "us-central1-f"}
+		inst, nodeClaim, nodeClass := instanceLabelsFixture()
+
+		p.setupInstanceLabels(inst, nodeClaim, nodeClass, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", count)
+
+		require.Equal(t, strconv.Itoa(count), inst.Labels[countKey],
+			"local-SSD count %d must be stamped on the instance label %q", count, countKey)
+	}
 }
 
 func TestBuildInstance_DoesNotCopyKubernetesSchedulingLabelsToGCELabels(t *testing.T) {
@@ -1651,6 +2629,7 @@ func TestBuildInstance_DoesNotCopyKubernetesSchedulingLabelsToGCELabels(t *testi
 		makeCluster("net", "subnet", "pods", false),
 		"us-central1-f", "karpenter-no-label-leak",
 		karpv1.CapacityTypeOnDemand,
+		nil, 0, "pods",
 	)
 
 	require.NoError(t, err)
@@ -1670,7 +2649,7 @@ func TestSetupInstanceLabels_ClusterNameNotOverwrittenByRequirements(t *testing.
 
 	p := &DefaultProvider{clusterName: "real-cluster", clusterLocation: "us-central1-f"}
 	inst, nodeClaim, nodeClass := instanceLabelsFixture()
-	p.setupInstanceLabels(inst, nodeClaim, nodeClass, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+	p.setupInstanceLabels(inst, nodeClaim, nodeClass, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", 0)
 
 	nameKey := utils.SanitizeGCELabelValue(utils.LabelClusterNameKey)
 	require.Equal(t, "real-cluster", inst.Labels[nameKey],
@@ -1682,7 +2661,7 @@ func TestSetupInstanceLabels_ClusterLocationNotOverwrittenByRequirements(t *test
 
 	p := &DefaultProvider{clusterName: "my-cluster", clusterLocation: "us-central1-f"}
 	inst, nodeClaim, nodeClass := instanceLabelsFixture()
-	p.setupInstanceLabels(inst, nodeClaim, nodeClass, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+	p.setupInstanceLabels(inst, nodeClaim, nodeClass, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", 0)
 
 	locationKey := utils.SanitizeGCELabelValue(utils.LabelClusterLocationKey)
 	require.Equal(t, "us-central1-f", inst.Labels[locationKey],
@@ -1723,7 +2702,7 @@ func TestWaitOperationDone_RetriesOnTransient503(t *testing.T) {
 		writeJSON(w, &compute.Operation{Name: "op-123", Status: "DONE"})
 	}))
 
-	err := p.waitOperationDone(context.Background(), "n1-standard-1", "us-central1-a", "on-demand", "op-123")
+	err := p.waitOperationDone(context.Background(), "us-central1-a", "op-123")
 	require.NoError(t, err)
 
 	require.Equal(t, int32(3), callCount.Load())
@@ -1740,7 +2719,7 @@ func TestWaitOperationDone_FailsOnPersistent503(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 
-	err := p.waitOperationDone(ctx, "n1-standard-1", "us-central1-a", "on-demand", "op-123")
+	err := p.waitOperationDone(ctx, "us-central1-a", "op-123")
 
 	require.Error(t, err)
 }
@@ -1907,6 +2886,375 @@ func TestSetupServiceAccounts_ErrorWhenNoSAAvailable(t *testing.T) {
 	require.Contains(t, err.Error(), "no service account available")
 }
 
+func machineTypeWithBundledSSDs(count int32) *computepb.MachineType {
+	if count == 0 {
+		return &computepb.MachineType{}
+	}
+	return &computepb.MachineType{
+		BundledLocalSsds: &computepb.BundledLocalSsds{
+			PartitionCount: ptr.To(count),
+		},
+	}
+}
+
+func TestOnHostMaintenancePolicy(t *testing.T) {
+	t.Parallel()
+
+	newIT := func(name string, gpu bool) *cloudprovider.InstanceType {
+		gpuReq := scheduling.NewRequirement(v1alpha1.LabelInstanceGPUCount, corev1.NodeSelectorOpDoesNotExist)
+		if gpu {
+			gpuReq = scheduling.NewRequirement(v1alpha1.LabelInstanceGPUCount, corev1.NodeSelectorOpIn, "1")
+		}
+		return &cloudprovider.InstanceType{Name: name, Requirements: scheduling.NewRequirements(gpuReq)}
+	}
+
+	cases := []struct {
+		name         string
+		instanceType *cloudprovider.InstanceType
+		capacityType string
+		mt           *computepb.MachineType
+		want         string
+	}{
+		{
+			"z4d smallest shape requires MIGRATE",
+			newIT("z4d-highmem-8-highlssd", false), karpv1.CapacityTypeOnDemand, machineTypeWithBundledSSDs(1), "MIGRATE",
+		},
+		{
+			"z4d 42000 GiB boundary requires MIGRATE",
+			newIT("z4d-highmem-192-standardlssd", false), karpv1.CapacityTypeOnDemand, machineTypeWithBundledSSDs(12), "MIGRATE",
+		},
+		{
+			"z4d highlssd 84000 GiB requires TERMINATE",
+			newIT("z4d-highmem-192-highlssd", false), karpv1.CapacityTypeOnDemand, machineTypeWithBundledSSDs(24), "TERMINATE",
+		},
+		{
+			"z4d standardlssd 84000 GiB requires TERMINATE",
+			newIT("z4d-highmem-384-standardlssd", false), karpv1.CapacityTypeOnDemand, machineTypeWithBundledSSDs(24), "TERMINATE",
+		},
+		{
+			"z4d spot overrides MIGRATE",
+			newIT("z4d-highmem-8-highlssd", false), karpv1.CapacityTypeSpot, machineTypeWithBundledSSDs(1), "TERMINATE",
+		},
+		{
+			"z4d missing machine metadata falls back to MIGRATE",
+			newIT("z4d-highmem-192-highlssd", false), karpv1.CapacityTypeOnDemand, nil, "MIGRATE",
+		},
+		{
+			"z4d missing partition count falls back to MIGRATE",
+			newIT("z4d-highmem-192-highlssd", false), karpv1.CapacityTypeOnDemand, &computepb.MachineType{BundledLocalSsds: &computepb.BundledLocalSsds{}}, "MIGRATE",
+		},
+		{
+			"z4d metal keeps TERMINATE",
+			newIT("z4d-highmem-384-standardlssd-metal", false), karpv1.CapacityTypeOnDemand, machineTypeWithBundledSSDs(24), "TERMINATE",
+		},
+		{
+			"z3 non-metal lssd ≤18 TiB on-demand requires MIGRATE",
+			newIT("z3-highmem-22-standardlssd", false), karpv1.CapacityTypeOnDemand, machineTypeWithBundledSSDs(2), "MIGRATE",
+		},
+		{
+			"z3 non-metal lssd spot keeps TERMINATE (spot wins)",
+			newIT("z3-highmem-22-standardlssd", false), karpv1.CapacityTypeSpot, machineTypeWithBundledSSDs(2), "TERMINATE",
+		},
+		{
+			"z3-highmem-88-highlssd 12 partitions = 35 TiB requires TERMINATE",
+			newIT("z3-highmem-88-highlssd", false), karpv1.CapacityTypeOnDemand, machineTypeWithBundledSSDs(12), "TERMINATE",
+		},
+		{
+			"z3-highmem-176-standardlssd 12 partitions = 35 TiB requires TERMINATE",
+			newIT("z3-highmem-176-standardlssd", false), karpv1.CapacityTypeOnDemand, machineTypeWithBundledSSDs(12), "TERMINATE",
+		},
+		{
+			"z3 non-metal 6 partitions = 17.58 TiB stays MIGRATE (under 18 TiB)",
+			newIT("z3-highmem-88-standardlssd", false), karpv1.CapacityTypeOnDemand, machineTypeWithBundledSSDs(6), "MIGRATE",
+		},
+		{
+			"z3 non-metal cache miss (mt nil) falls back to MIGRATE",
+			newIT("z3-highmem-88-highlssd", false), karpv1.CapacityTypeOnDemand, nil, "MIGRATE",
+		},
+		{
+			"z3 highlssd-metal on-demand: bare metal explicit TERMINATE",
+			newIT("z3-highmem-192-highlssd-metal", false), karpv1.CapacityTypeOnDemand, machineTypeWithBundledSSDs(12), "TERMINATE",
+		},
+		{
+			"c4 lssd-metal on-demand: bare metal explicit TERMINATE",
+			newIT("c4-standard-288-lssd-metal", false), karpv1.CapacityTypeOnDemand, machineTypeWithBundledSSDs(6), "TERMINATE",
+		},
+		{
+			"h4d-highmem-192-lssd on-demand: HPC, no live migration → TERMINATE",
+			newIT("h4d-highmem-192-lssd", false), karpv1.CapacityTypeOnDemand, machineTypeWithBundledSSDs(10), "TERMINATE",
+		},
+		{
+			"h4d-standard-192 (no -lssd) on-demand: HPC, no live migration → TERMINATE",
+			newIT("h4d-standard-192", false), karpv1.CapacityTypeOnDemand, nil, "TERMINATE",
+		},
+		{
+			"GPU on-demand returns TERMINATE",
+			newIT("a2-highgpu-1g", true), karpv1.CapacityTypeOnDemand, nil, "TERMINATE",
+		},
+		{
+			"n2d on-demand falls through",
+			newIT("n2d-standard-4", false), karpv1.CapacityTypeOnDemand, nil, "",
+		},
+		{
+			"n2d spot returns TERMINATE",
+			newIT("n2d-standard-4", false), karpv1.CapacityTypeSpot, nil, "TERMINATE",
+		},
+		{
+			"c4d-lssd on-demand falls through (GCE accepts MIGRATE or TERMINATE)",
+			newIT("c4d-standard-8-lssd", false), karpv1.CapacityTypeOnDemand, machineTypeWithBundledSSDs(2), "",
+		},
+		{
+			"c4a-lssd on-demand falls through (GCE accepts MIGRATE or TERMINATE)",
+			newIT("c4a-standard-8-lssd", false), karpv1.CapacityTypeOnDemand, machineTypeWithBundledSSDs(2), "",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			require.Equal(t, tc.want, onHostMaintenancePolicy(tc.instanceType, tc.capacityType, tc.mt))
+		})
+	}
+}
+
+func makeVariant(name string, odPrice float64, ssdCount int, ephemeralGiB int64) *cloudprovider.InstanceType {
+	reqs := scheduling.NewRequirements(
+		scheduling.NewRequirement(corev1.LabelInstanceTypeStable, corev1.NodeSelectorOpIn, name),
+		scheduling.NewRequirement(v1alpha1.LabelInstanceLocalSsdCount, corev1.NodeSelectorOpIn, fmt.Sprintf("%d", ssdCount)),
+	)
+	offering := &cloudprovider.Offering{
+		Available: true,
+		Price:     odPrice,
+		Requirements: scheduling.NewRequirements(
+			scheduling.NewRequirement(karpv1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, karpv1.CapacityTypeOnDemand),
+			scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, "us-central1-a"),
+		),
+	}
+	cap := corev1.ResourceList{}
+	if ephemeralGiB > 0 {
+		cap[corev1.ResourceEphemeralStorage] = *resource.NewQuantity(ephemeralGiB*1024*1024*1024, resource.BinarySI)
+	}
+	return &cloudprovider.InstanceType{
+		Name:         name,
+		Requirements: reqs,
+		Offerings:    cloudprovider.Offerings{offering},
+		Capacity:     cap,
+	}
+}
+
+func orderedVariantSSDCounts(its []*cloudprovider.InstanceType) []int {
+	out := make([]int, len(its))
+	for i, it := range its {
+		out[i] = variantSSDCount(it)
+	}
+	return out
+}
+
+func TestVariantSSDCount(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		it   *cloudprovider.InstanceType
+		want int
+	}{
+		{
+			name: "count=0 variant",
+			it:   makeVariant("n2d-standard-8", 1.0, 0, 0),
+			want: 0,
+		},
+		{
+			name: "count=4 variant",
+			it:   makeVariant("n2d-standard-8", 1.0, 4, 0),
+			want: 4,
+		},
+		{
+			name: "count=24 variant",
+			it:   makeVariant("n2d-standard-8", 1.0, 24, 0),
+			want: 24,
+		},
+		{
+			name: "no requirement → 0",
+			it: &cloudprovider.InstanceType{
+				Name: "e2-medium",
+				Requirements: scheduling.NewRequirements(
+					scheduling.NewRequirement(corev1.LabelInstanceTypeStable, corev1.NodeSelectorOpIn, "e2-medium"),
+				),
+			},
+			want: 0,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			require.Equal(t, tc.want, variantSSDCount(tc.it))
+		})
+	}
+}
+
+func TestInstanceTypesForLaunch(t *testing.T) {
+	t.Parallel()
+
+	configurable := func(counts ...int) []*cloudprovider.InstanceType {
+		return lo.Map(counts, func(count int, _ int) *cloudprovider.InstanceType {
+			return makeVariant("n2d-standard-8", 1.0, count, 0)
+		})
+	}
+	bundled := makeVariant("c4-standard-4-lssd", 2.0, 1, 0)
+	ordinary := makeVariant("e2-standard-4", 0.5, 0, 0)
+	nodeClaim := func(requirement *karpv1.NodeSelectorRequirementWithMinValues) *karpv1.NodeClaim {
+		claim := &karpv1.NodeClaim{}
+		if requirement != nil {
+			claim.Spec.Requirements = []karpv1.NodeSelectorRequirementWithMinValues{*requirement}
+		}
+		return claim
+	}
+	countReq := func(operator corev1.NodeSelectorOperator, values ...string) *karpv1.NodeSelectorRequirementWithMinValues {
+		return &karpv1.NodeSelectorRequirementWithMinValues{Key: v1alpha1.LabelInstanceLocalSsdCount, Operator: operator, Values: values}
+	}
+	ids := func(instanceTypes []*cloudprovider.InstanceType) []string {
+		return lo.Map(instanceTypes, func(instanceType *cloudprovider.InstanceType, _ int) string {
+			return fmt.Sprintf("%s:%d", instanceType.Name, variantSSDCount(instanceType))
+		})
+	}
+
+	cases := []struct {
+		name     string
+		claim    *karpv1.NodeClaim
+		input    []*cloudprovider.InstanceType
+		want     []string
+		rejected bool
+	}{
+		{name: "absent count defaults configurable family to zero", claim: nodeClaim(nil), input: append(configurable(0, 2, 4), bundled, ordinary), want: []string{"n2d-standard-8:0", "c4-standard-4-lssd:1", "e2-standard-4:0"}, rejected: true},
+		{name: "explicit zero", claim: nodeClaim(countReq(corev1.NodeSelectorOpIn, "0")), input: append(configurable(0), ordinary), want: []string{"n2d-standard-8:0", "e2-standard-4:0"}},
+		{name: "exact positive count", claim: nodeClaim(countReq(corev1.NodeSelectorOpIn, "4")), input: configurable(4), want: []string{"n2d-standard-8:4"}},
+		{name: "broad greater-than keeps bundled fallback", claim: nodeClaim(countReq(corev1.NodeSelectorOpGt, "0")), input: append(configurable(2, 4), bundled), want: []string{"c4-standard-4-lssd:1"}, rejected: true},
+		{name: "positive-only multi value rejects configurable rows", claim: nodeClaim(countReq(corev1.NodeSelectorOpIn, "2", "4")), input: configurable(2, 4), want: []string{}, rejected: true},
+		{name: "multi value including zero rejects configurable rows", claim: nodeClaim(countReq(corev1.NodeSelectorOpIn, "0", "2", "4")), input: configurable(0, 2, 4), want: []string{}, rejected: true},
+		{name: "exists rejects configurable rows", claim: nodeClaim(countReq(corev1.NodeSelectorOpExists)), input: configurable(0, 2, 4), want: []string{}, rejected: true},
+		{name: "static broad count rejects configurable rows", claim: nodeClaim(countReq(corev1.NodeSelectorOpGt, "0")), input: configurable(2, 4), want: []string{}, rejected: true},
+		{name: "invalid singleton rejects configurable rows", claim: nodeClaim(countReq(corev1.NodeSelectorOpIn, "invalid")), input: configurable(0, 2, 4), want: []string{}, rejected: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, rejected := instanceTypesForLaunch(tc.claim, tc.input)
+			require.Equal(t, tc.want, ids(got))
+			require.Equal(t, tc.rejected, rejected)
+		})
+	}
+}
+
+func TestValidateLaunchInstanceTypes_ClassifiesAmbiguousCountForImmediateDeletion(t *testing.T) {
+	t.Parallel()
+
+	_, err := validateLaunchInstanceTypes(nil, true)
+	require.True(t, cloudprovider.IsInsufficientCapacityError(err))
+	require.Contains(t, err.Error(), v1alpha1.LabelInstanceLocalSsdCount)
+	require.Contains(t, err.Error(), "count=0 variant that fits the request")
+}
+
+func TestInstanceTypesForLaunch_RecomputesCapacityTypeAfterFiltering(t *testing.T) {
+	t.Parallel()
+
+	configurableSpot := makeVariant("n2d-standard-8", 1.0, 2, 0)
+	configurableSpot.Offerings[0].Requirements = scheduling.NewRequirements(
+		scheduling.NewRequirement(karpv1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, karpv1.CapacityTypeSpot),
+		scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, "us-central1-a"),
+	)
+	bundledOnDemand := makeVariant("c4-standard-4-lssd", 2.0, 1, 0)
+	claim := &karpv1.NodeClaim{Spec: karpv1.NodeClaimSpec{Requirements: []karpv1.NodeSelectorRequirementWithMinValues{
+		{Key: v1alpha1.LabelInstanceLocalSsdCount, Operator: corev1.NodeSelectorOpGt, Values: []string{"0"}},
+		{Key: karpv1.CapacityTypeLabelKey, Operator: corev1.NodeSelectorOpIn, Values: []string{karpv1.CapacityTypeSpot, karpv1.CapacityTypeOnDemand}},
+	}}}
+
+	provider := &DefaultProvider{}
+	require.Equal(t, karpv1.CapacityTypeSpot, provider.getCapacityType(claim, []*cloudprovider.InstanceType{configurableSpot, bundledOnDemand}))
+	launch, rejected := instanceTypesForLaunch(claim, []*cloudprovider.InstanceType{configurableSpot, bundledOnDemand})
+	require.True(t, rejected)
+	require.Equal(t, []*cloudprovider.InstanceType{bundledOnDemand}, launch)
+	require.Equal(t, karpv1.CapacityTypeOnDemand, provider.getCapacityType(claim, launch), "removed configurable spot rows must not force a bundled fallback onto spot")
+}
+
+func TestOrderInstanceTypesByPrice_Case1_NoCountSelector(t *testing.T) {
+	t.Parallel()
+
+	requirements := scheduling.NewRequirements(
+		scheduling.NewRequirement(corev1.LabelInstanceTypeStable, corev1.NodeSelectorOpIn, "n2d-standard-8"),
+		scheduling.NewRequirement(karpv1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, karpv1.CapacityTypeOnDemand),
+	)
+
+	for _, perm := range [][]int{
+		{4, 0, 16, 2, 24, 1, 8},
+		{24, 16, 8, 4, 2, 1, 0},
+		{0, 1, 2, 4, 8, 16, 24},
+	} {
+		var in []*cloudprovider.InstanceType
+		for _, c := range perm {
+			in = append(in, makeVariant("n2d-standard-8", 1.0, c, 0))
+		}
+		got := orderedVariantSSDCounts(orderInstanceTypesByPrice(in, requirements))
+		require.Equal(t, []int{0, 1, 2, 4, 8, 16, 24}, got,
+			"variant order should be deterministic ascending regardless of input permutation %v", perm)
+	}
+}
+
+func TestOrderInstanceTypesByPrice_Case2_CountSelector(t *testing.T) {
+	t.Parallel()
+
+	requirements := scheduling.NewRequirements(
+		scheduling.NewRequirement(corev1.LabelInstanceTypeStable, corev1.NodeSelectorOpIn, "n2d-standard-8"),
+		scheduling.NewRequirement(v1alpha1.LabelInstanceLocalSsdCount, corev1.NodeSelectorOpIn, "4"),
+		scheduling.NewRequirement(karpv1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, karpv1.CapacityTypeOnDemand),
+	)
+	in := []*cloudprovider.InstanceType{makeVariant("n2d-standard-8", 1.0, 4, 0)}
+	got := orderedVariantSSDCounts(orderInstanceTypesByPrice(in, requirements))
+	require.Equal(t, []int{4}, got)
+}
+
+func TestOrderInstanceTypesByPrice_Case3_EphemeralCapacity(t *testing.T) {
+	t.Parallel()
+
+	requirements := scheduling.NewRequirements(
+		scheduling.NewRequirement(corev1.LabelInstanceTypeStable, corev1.NodeSelectorOpIn, "n2d-standard-8"),
+		scheduling.NewRequirement(karpv1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, karpv1.CapacityTypeOnDemand),
+	)
+
+	in := []*cloudprovider.InstanceType{
+		makeVariant("n2d-standard-8", 1.0, 24, 24*375),
+		makeVariant("n2d-standard-8", 1.0, 4, 4*375),
+		makeVariant("n2d-standard-8", 1.0, 8, 8*375),
+		makeVariant("n2d-standard-8", 1.0, 2, 2*375),
+		makeVariant("n2d-standard-8", 1.0, 16, 16*375),
+	}
+	got := orderedVariantSSDCounts(orderInstanceTypesByPrice(in, requirements))
+	require.Equal(t, []int{2, 4, 8, 16, 24}, got,
+		"same-name variants must retain deterministic count ordering")
+}
+
+func TestOrderInstanceTypesByPrice_DistinctMachineTypes(t *testing.T) {
+	t.Parallel()
+
+	requirements := scheduling.NewRequirements(
+		scheduling.NewRequirement(karpv1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, karpv1.CapacityTypeOnDemand),
+	)
+	in := []*cloudprovider.InstanceType{
+		makeVariant("n2d-standard-8", 2.0, 4, 0),
+		makeVariant("n2-standard-4", 1.0, 0, 0),
+		makeVariant("n2-standard-4", 1.0, 2, 0),
+		makeVariant("n2d-standard-8", 2.0, 0, 0),
+	}
+	got := orderInstanceTypesByPrice(in, requirements)
+	names := make([]string, len(got))
+	counts := make([]int, len(got))
+	for i, it := range got {
+		names[i] = it.Name
+		counts[i] = variantSSDCount(it)
+	}
+	require.Equal(t, []string{"n2-standard-4", "n2-standard-4", "n2d-standard-8", "n2d-standard-8"}, names)
+	require.Equal(t, []int{0, 2, 0, 4}, counts)
+}
+
 // makeNonGPUIT returns a minimal on-demand instance type with no GPU requirements,
 // suitable for testing Confidential VM wiring without triggering the GPU TERMINATE override.
 func makeNonGPUIT() *cloudprovider.InstanceType {
@@ -1919,6 +3267,7 @@ func makeNonGPUIT() *cloudprovider.InstanceType {
 		},
 		Requirements: scheduling.NewRequirements(
 			scheduling.NewRequirement(corev1.LabelArchStable, corev1.NodeSelectorOpIn, "amd64"),
+			scheduling.NewRequirement(v1alpha1.LabelInstanceGPUCount, corev1.NodeSelectorOpDoesNotExist),
 		),
 		Overhead: &cloudprovider.InstanceTypeOverhead{KubeReserved: corev1.ResourceList{}},
 	}
@@ -1938,6 +3287,7 @@ func buildConfidentialInstance(t *testing.T, nc *v1alpha1.GCENodeClass) *compute
 		makeCluster("projects/p/global/networks/my-vpc", "regions/us-central1/subnetworks/my-subnet", "pods", false),
 		"us-central1-a", "karpenter-confidential-test",
 		karpv1.CapacityTypeOnDemand,
+		nil, 0, "pods",
 	)
 	require.NoError(t, err)
 	return instance
@@ -1981,6 +3331,91 @@ func TestConfidentialInstanceType(t *testing.T) {
 	}
 }
 
+func TestMinCpuPlatform(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name     string
+		platform string
+		want     string
+	}{
+		{name: "unset leaves the platform to GCE"},
+		{name: "Ice Lake", platform: "Intel Ice Lake", want: "Intel Ice Lake"},
+		{name: "Granite Rapids", platform: "Intel Granite Rapids", want: "Intel Granite Rapids"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			nc := &v1alpha1.GCENodeClass{}
+			nc.Spec.MinCpuPlatform = tc.platform
+
+			instance := buildConfidentialInstance(t, nc)
+
+			require.Equal(t, tc.want, instance.MinCpuPlatform)
+		})
+	}
+}
+
+func TestAdvancedMachineFeatures(t *testing.T) {
+	t.Parallel()
+
+	enabled, disabled := true, false
+	one, two := int32(1), int32(2)
+	cases := []struct {
+		name string
+		amf  *v1alpha1.AdvancedMachineFeatures
+		// want is nil when the instance must carry no AdvancedMachineFeatures.
+		want *compute.AdvancedMachineFeatures
+	}{
+		{name: "unset"},
+		{name: "empty", amf: &v1alpha1.AdvancedMachineFeatures{}},
+		{
+			name: "nested virtualization enabled",
+			amf:  &v1alpha1.AdvancedMachineFeatures{EnableNestedVirtualization: &enabled},
+			want: &compute.AdvancedMachineFeatures{EnableNestedVirtualization: true, ForceSendFields: []string{"EnableNestedVirtualization"}},
+		},
+		{
+			name: "nested virtualization disabled",
+			amf:  &v1alpha1.AdvancedMachineFeatures{EnableNestedVirtualization: &disabled},
+			want: &compute.AdvancedMachineFeatures{ForceSendFields: []string{"EnableNestedVirtualization"}},
+		},
+		{
+			name: "one thread per core",
+			amf:  &v1alpha1.AdvancedMachineFeatures{ThreadsPerCore: &one},
+			want: &compute.AdvancedMachineFeatures{ThreadsPerCore: 1},
+		},
+		{
+			name: "two threads per core",
+			amf:  &v1alpha1.AdvancedMachineFeatures{ThreadsPerCore: &two},
+			want: &compute.AdvancedMachineFeatures{ThreadsPerCore: 2},
+		},
+		{
+			name: "nested virtualization with one thread per core",
+			amf:  &v1alpha1.AdvancedMachineFeatures{EnableNestedVirtualization: &enabled, ThreadsPerCore: &one},
+			want: &compute.AdvancedMachineFeatures{EnableNestedVirtualization: true, ThreadsPerCore: 1, ForceSendFields: []string{"EnableNestedVirtualization"}},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			nc := &v1alpha1.GCENodeClass{}
+			nc.Spec.AdvancedMachineFeatures = tc.amf
+
+			instance := buildConfidentialInstance(t, nc)
+
+			if tc.want == nil {
+				require.Nil(t, instance.AdvancedMachineFeatures)
+				return
+			}
+			require.Equal(t, tc.want, instance.AdvancedMachineFeatures)
+		})
+	}
+}
+
 func TestGetOrCreateInstance_AdoptsInstanceFromEarlierAttemptZone(t *testing.T) {
 	t.Parallel()
 
@@ -2008,7 +3443,7 @@ func TestGetOrCreateInstance_AdoptsInstanceFromEarlierAttemptZone(t *testing.T) 
 	nodeClaim.Name = "default-vzmzs"
 
 	instance, zone, retryable, err := p.getOrCreateInstance(context.Background(), nodeClaim, nil, nil, nil, nil,
-		"us-central1-c", karpv1.CapacityTypeOnDemand, []string{"us-central1-f"})
+		"us-central1-c", karpv1.CapacityTypeOnDemand, []string{"us-central1-f"}, nil, 0, nil)
 
 	require.NoError(t, err)
 	require.False(t, retryable)
@@ -2037,9 +3472,11 @@ func TestGetOrCreateInstance_AdoptsInstanceInSelectedZone(t *testing.T) {
 
 	nodeClaim := &karpv1.NodeClaim{}
 	nodeClaim.Name = "default-sgfkv"
+	cluster := makeCluster("projects/p/global/networks/default", "", "", false)
+	cluster.NetworkConfig.EnableMultiNetworking = true
 
-	instance, zone, retryable, err := p.getOrCreateInstance(context.Background(), nodeClaim, nil, nil, nil, nil,
-		"us-central1-c", karpv1.CapacityTypeOnDemand, nil)
+	instance, zone, retryable, err := p.getOrCreateInstance(context.Background(), nodeClaim, &v1alpha1.GCENodeClass{}, makeNonGPUIT(), makeSourceMetadata(""), cluster,
+		"us-central1-c", karpv1.CapacityTypeOnDemand, nil, nil, 0, nil)
 
 	require.NoError(t, err)
 	require.False(t, retryable)
@@ -2055,4 +3492,134 @@ func TestLastPathSegment(t *testing.T) {
 	require.Equal(t, "e2-standard-16", lastPathSegment("zones/us-central1-f/machineTypes/e2-standard-16"))
 	require.Equal(t, "us-central1-c", lastPathSegment("us-central1-c"))
 	require.Equal(t, "", lastPathSegment(""))
+}
+
+func TestPatchLocalSSDMetadata(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name          string
+		mode          v1alpha1.LocalSSDMode
+		count         int
+		sourceKubeEnv string
+		wantEnv       []string
+		wantNotEnv    []string
+		wantLabels    []string
+		wantNotLabels []string
+	}{
+		{
+			name:          "RawBlock count 4",
+			mode:          v1alpha1.LocalSSDModeRawBlock,
+			count:         4,
+			wantEnv:       []string{"NODE_LOCAL_NVME_SSD_BLOCK_EXT: 4,nvme,block"},
+			wantNotEnv:    []string{"NODE_EPHEMERAL_STORAGE_LOCAL_SSD"},
+			wantLabels:    []string{"cloud.google.com/gke-local-nvme-ssd=true"},
+			wantNotLabels: []string{"cloud.google.com/gke-ephemeral-storage-local-ssd"},
+		},
+		{
+			name:          "empty mode defaults to RawBlock",
+			mode:          "",
+			count:         2,
+			wantEnv:       []string{"NODE_LOCAL_NVME_SSD_BLOCK_EXT: 2,nvme,block"},
+			wantLabels:    []string{"cloud.google.com/gke-local-nvme-ssd=true"},
+			wantNotLabels: []string{"cloud.google.com/gke-ephemeral-storage-local-ssd"},
+		},
+		{
+			name:          "Ephemeral drops inherited EXT key",
+			mode:          v1alpha1.LocalSSDModeEphemeral,
+			count:         2,
+			sourceKubeEnv: "NODE_LOCAL_NVME_SSD_BLOCK_EXT: 8,nvme,block\n",
+			wantEnv:       []string{"NODE_EPHEMERAL_STORAGE_LOCAL_SSD: true"},
+			wantNotEnv:    []string{"NODE_LOCAL_NVME_SSD_BLOCK_EXT"},
+			wantLabels:    []string{"cloud.google.com/gke-ephemeral-storage-local-ssd=true"},
+			wantNotLabels: []string{"cloud.google.com/gke-local-nvme-ssd"},
+		},
+		{
+			name:          "count 0 is a no-op",
+			mode:          v1alpha1.LocalSSDModeRawBlock,
+			count:         0,
+			wantNotEnv:    []string{"NODE_LOCAL_NVME_SSD_BLOCK_EXT", "NODE_EPHEMERAL_STORAGE_LOCAL_SSD"},
+			wantNotLabels: []string{"cloud.google.com/gke-local-nvme-ssd", "cloud.google.com/gke-ephemeral-storage-local-ssd"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			source := computeMetadataValues(map[string]string{
+				metadata.KubeEnvKey:    tc.sourceKubeEnv,
+				metadata.KubeLabelsKey: "",
+			})
+			target, err := metadata.FromSourceTemplate(source)
+			require.NoError(t, err)
+
+			nc := &v1alpha1.GCENodeClass{Spec: v1alpha1.GCENodeClassSpec{LocalSsdMode: tc.mode}}
+			patchLocalSSDMetadata(target, nc, tc.count)
+
+			rendered, err := target.ToComputeMetadata()
+			require.NoError(t, err)
+			var kubeEnv, kubeLabels string
+			for _, item := range rendered.Items {
+				switch item.Key {
+				case metadata.KubeEnvKey:
+					kubeEnv = ptr.Deref(item.Value, "")
+				case metadata.KubeLabelsKey:
+					kubeLabels = ptr.Deref(item.Value, "")
+				}
+			}
+			for _, want := range tc.wantEnv {
+				require.Contains(t, kubeEnv, want)
+			}
+			for _, notWant := range tc.wantNotEnv {
+				require.NotContains(t, kubeEnv, notWant)
+			}
+			for _, want := range tc.wantLabels {
+				require.Contains(t, kubeLabels, want)
+			}
+			for _, notWant := range tc.wantNotLabels {
+				require.NotContains(t, kubeLabels, notWant)
+			}
+		})
+	}
+}
+
+func (*fakeGKEProvider) InvalidateClusterConfig() {}
+
+func TestInsufficientCapacityBackoffTTLUsesOptions(t *testing.T) {
+	t.Parallel()
+
+	ctx := options.ToContext(context.Background(), &options.Options{
+		StockoutTTL:                 2 * time.Minute,
+		IPSpaceExhaustedTTL:         10 * time.Second,
+		UnsupportedConfigurationTTL: 3 * time.Hour,
+		QuotaExceededTTL:            time.Hour,
+	})
+	require.Equal(t, 2*time.Minute, insufficientCapacityBackoffTTL(ctx, insufficientCapacityDetails{code: "ZONE_RESOURCE_POOL_EXHAUSTED"}))
+	require.Equal(t, 10*time.Second, insufficientCapacityBackoffTTL(ctx, insufficientCapacityDetails{code: "IP_SPACE_EXHAUSTED"}))
+	require.Equal(t, 3*time.Hour, insufficientCapacityBackoffTTL(ctx, insufficientCapacityDetails{code: "MACHINE_TYPE_UNSUPPORTED"}))
+	require.Equal(t, time.Hour, insufficientCapacityBackoffTTL(ctx, insufficientCapacityDetails{code: "QUOTA_EXCEEDED"}))
+}
+
+// TestRenderDiskPropertiesBootDiskSwapDoesNotMutateNodeClass protects callers
+// that reuse the NodeClass: rendering the default boot disk must not reorder or
+// extend the disks the node class owns.
+func TestRenderDiskPropertiesBootDiskSwapDoesNotMutateNodeClass(t *testing.T) {
+	t.Parallel()
+
+	p := &DefaultProvider{projectID: "my-project"}
+	nodeClass := bootDiskNodeClass("pd-balanced", nil, nil)
+	nodeClass.Spec.Disks = []v1alpha1.Disk{
+		{SizeGiB: 200, DeviceName: "data"},
+		{Boot: true, SizeGiB: 100, Category: "pd-balanced"},
+	}
+	defaultBootDisk := &v1alpha1.Disk{SizeGiB: 100, Category: "pd-standard", Boot: true}
+
+	_, err := p.renderDiskProperties(amd64InstanceType(), spotOrOnDemandNodeClaim(), nodeClass, "us-central1-a", 0, defaultBootDisk)
+	require.NoError(t, err)
+
+	require.Equal(t, []v1alpha1.Disk{
+		{SizeGiB: 200, DeviceName: "data"},
+		{Boot: true, SizeGiB: 100, Category: "pd-balanced"},
+	}, nodeClass.Spec.Disks, "the provider must not reorder or extend the node class's disks")
 }

@@ -37,13 +37,14 @@ Key capabilities:
 
 - [Installation](getting-started/installation.md) — deploy Karpenter on a GKE cluster using Helm
 - [Quick start](getting-started/quick-start.md) — create your first NodePool and GCENodeClass, and trigger node provisioning
-- [Terraform](https://github.com/cloudpilot-ai/karpenter-provider-gcp/tree/main/deploy/terraform) — provision the full GCP infrastructure (VPC, GKE cluster, service accounts) with Terraform
+- [Terraform](https://github.com/cloudpilot-ai/karpenter-provider-gcp/tree/main/deploy/terraform) — provision the full GCP infrastructure (VPC, GKE cluster, system node pool, service accounts) with Terraform
 
 ## Features
 
 - [GPU nodes](gpu-nodes.md) — GPU instance types, driver version control, and device plugin scheduling
 - [Image selection](image-selection.md) — select node images by GKE release channel, version pin, or raw image ID
 - [Node repair](node-repair.md) — automatic replacement of nodes that fail GKE health conditions
+- [Spot preemption notice](spot-preemption.md) — get up to two minutes' warning before GCE reclaims a Spot VM
 - [Static capacity](examples/static-capacity.md) — keep a fixed number of nodes running with `spec.replicas`
 - [Image management](image-management.md) — controlling GKE node image selection, version pinning, and drift
 
@@ -59,9 +60,9 @@ Key capabilities:
 - [arm64](examples/arm64.md) — Google Axion and Ampere Altra nodes
 - [Ubuntu](examples/ubuntu.md) — Ubuntu image family
 - [GPU](examples/gpu.md) — GPU workloads
-- [Networking](examples/networking.md) — private nodes, custom subnetwork, pod IP range
+- [Networking](examples/networking.md) — private nodes, custom subnetwork, pod IP range, resource manager tags
 - [Static capacity](examples/static-capacity.md) — fixed node count with `spec.replicas`
-- [Advanced](examples/advanced.md) — kubelet config, Shielded VM, Confidential VM, metadata, secondary disk, multiple pools
+- [Advanced](examples/advanced.md) — kubelet config, static hugepages, Shielded VM, Confidential VM, nested virtualization, local SSDs, metadata, secondary disk, multiple pools
 
 ## Community
 

@@ -93,16 +93,21 @@ serviceMonitor:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| additionalAnnotations | object | `{}` | Additional annotations to add into metadata. |
+| additionalAnnotations | object | `{}` | Additional annotations to add into metadata for templated resources (excludes CRDs). |
+| additionalLabels | object | `{}` | Additional labels to add into metadata for templated resources (excludes CRDs). Labels that the chart adds by default will not be overridden by these additional labels. |
 | controller.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution[0].labelSelector.matchLabels."app.kubernetes.io/name" | string | `"karpenter"` |  |
 | controller.affinity.podAntiAffinity.requiredDuringSchedulingIgnoredDuringExecution[0].topologyKey | string | `"kubernetes.io/hostname"` |  |
 | controller.disableControllerWarmup | bool | `true` | disableControllerWarmup controls whether controller sources (watches/informers) start before leader election is won. Set to false to enable warmup, which pre-populates caches and improves leader failover time. Default true matches karpenter-core default (warmup disabled). |
 | controller.env | list | `[]` |  |
+| controller.featureGates.capacityBuffer | bool | `false` | capacityBuffer is ALPHA and is disabled by default. Setting this to true enables CapacityBuffer support for pre-provisioning spare capacity. This provider does not install the CapacityBuffer CRD (GKE provides it natively starting at 1.35.2-gke.1842000) — enabling this on a cluster where the CRD isn't already installed fails at template render time. |
 | controller.featureGates.nodeOverlay | bool | `false` | nodeOverlay is ALPHA and is disabled by default. Setting this will allow the use of node overlay to impact scheduling decisions |
-| controller.featureGates.nodeRepair | bool | `false` | nodeRepair is ALPHA and is disabled by default. When enabled, Karpenter replaces nodes that fail GKE Node Problem Detector health conditions. |
+| controller.featureGates.nodeRepair | bool | `false` | nodeRepair is ALPHA and is disabled by default. When enabled, Karpenter replaces nodes that fail GKE Node Problem Detector health conditions. Repairs respect disruption budgets and replacement capacity, but skip draining unhealthy nodes. |
+| controller.featureGates.podDeletionCostManagement | bool | `false` | podDeletionCostManagement is ALPHA and is disabled by default. Manages pod-deletion-cost annotations so ReplicaSet scale-down prefers nodes targeted for consolidation. When enabled, existing pod-deletion-cost annotations no longer influence Karpenter disruption costs. |
 | controller.featureGates.reservedCapacity | bool | `false` | reservedCapacity enables scheduling to reserved/committed GCP capacity. Disabled: the GCP provider does not yet implement GCE reservation support (#239). |
 | controller.featureGates.spotToSpotConsolidation | bool | `true` |  |
 | controller.featureGates.staticCapacity | bool | `false` | staticCapacity is ALPHA and is disabled by default. When enabled, a NodePool with spec.replicas set maintains a fixed number of nodes regardless of pod demand (static node pool). consolidationPolicy and consolidateAfter are ignored on static NodePools. |
+| controller.featureGates.terminateFirstDrift | bool | `false` | terminateFirstDrift is ALPHA and is disabled by default. Allows drift to terminate a node before launching its replacement on a capacity-constrained NodePool. |
+| controller.featureGates.terminateFirstRepair | bool | `false` | terminateFirstRepair is ALPHA and is disabled by default. Allows repair to terminate an unhealthy node before launching its replacement on a capacity-constrained NodePool. Only takes effect with nodeRepair enabled and legacyNodeRepair disabled. |
 | controller.healthProbe.port | int | `8081` |  |
 | controller.image.pullPolicy | string | `"IfNotPresent"` |  |
 | controller.image.repository | string | `"public.ecr.aws/cloudpilotai/gcp/karpenter"` |  |
@@ -120,12 +125,22 @@ serviceMonitor:
 | controller.settings.defaultNodePoolTemplateName | string | `""` | Pin the GKE node pool used as the bootstrap metadata source. When set, Karpenter uses this pool exclusively and returns an error if it is not RUNNING. Leave empty to use automatic discovery (default-pool → first alphabetical RUNNING pool → fallback karpenter-fallback creation). |
 | controller.settings.defaultNodepoolServiceAccount | string | `""` | Default GCP service account email to attach to provisioned nodes. When set, overrides the Compute Engine default SA. Corresponds to the DEFAULT_NODEPOOL_SERVICE_ACCOUNT env var. Recommended: set to a dedicated SA with roles/container.nodeServiceAccount. Can be overridden per-NodeClass via GCENodeClass.spec.serviceAccount. |
 | controller.settings.ignoreDRARequests | bool | `true` | ignoreDRARequests controls whether Karpenter ignores pods' Dynamic Resource Allocation requests during scheduling simulations. Keep true unless the cluster has DRA drivers and resource claims that Karpenter should account for. |
+| controller.settings.ipSpaceExhaustedTTL | string | `""` | How long an instance type, zone and capacity type stays unavailable after a launch fails with IP_SPACE_EXHAUSTED on every pod range (e.g. `1m`). Leave empty for the controller default of 30s. Must be positive. Corresponds to the IP_SPACE_EXHAUSTED_TTL env var. |
+| controller.settings.launchTimeout | string | `""` | How long a NodeClaim may keep failing to launch with a non-capacity error before it is deleted and replaced (e.g. `10m`). Leave empty for the controller default of 5m. Must be positive. Corresponds to the LAUNCH_TIMEOUT env var. |
+| controller.settings.legacyNodeRepair | bool | `false` | Run the legacy forceful node repair controller instead of budgeted voluntary repair. Only takes effect with nodeRepair enabled. Terminate-first repair is ignored in legacy mode. |
 | controller.settings.nodeLocation | string | `""` | The exact GCP cluster location for GKE API calls (e.g., us-central1-a for zonal, us-central1 for regional). If not set, defaults to 'clusterLocation' for backward compatibility. |
+| controller.settings.preferencePolicy | string | `"Respect"` | preferencePolicy controls how Karpenter handles soft scheduling preferences. `Respect` is the default; `Ignore` disregards preferred node/pod affinity and anti-affinity plus ScheduleAnyway topology spread constraints. |
 | controller.settings.projectID | string | `""` | The GCP project ID. |
+| controller.settings.quotaExceededTTL | string | `""` | How long an instance type stays unavailable in the region after a launch fails with QUOTA_EXCEEDED (e.g. `1h`). Leave empty for the controller default of 30m; set to `0s` to disable quota backoff. Corresponds to the QUOTA_EXCEEDED_TTL env var. |
+| controller.settings.schedulerConfig | object | `{}` | Optional kube-scheduler behavior to mirror during scheduling simulations. Supports podTopologySpread.defaultConstraints; leave empty unless matching a known cluster scheduler configuration. |
+| controller.settings.stockoutTTL | string | `""` | How long an instance type, zone and capacity type stays unavailable after a launch fails with ZONE_RESOURCE_POOL_EXHAUSTED (e.g. `2m`). Leave empty for the controller default of 5m. Must be positive. Corresponds to the STOCKOUT_TTL env var. |
+| controller.settings.telemetry | bool | `false` | Send anonymized resource totals and Spot interruption events to CloudPilot AI. Off by default. See docs/settings.md#telemetry for exactly what is sent. Corresponds to the TELEMETRY env var. |
+| controller.settings.unsupportedConfigurationTTL | string | `""` | How long an instance type, zone and capacity type stays unavailable after GCE reports the zone does not support the requested configuration (e.g. `6h`). Leave empty for the controller default of 1h. Must be positive. Corresponds to the UNSUPPORTED_CONFIGURATION_TTL env var. |
 | controller.settings.vmMemoryOverheadPercent | float | `0.065` | The VM memory overhead as a percent that will be subtracted from the total memory for all instance types. The value of `0.075` equals to 7.5%. |
 | controller.strategy.rollingUpdate.maxUnavailable | int | `1` |  |
 | controller.terminationGracePeriodSeconds | int | `30` |  |
 | controller.tolerations | list | `[]` |  |
+| controller.topologySpreadConstraints | list | `[]` |  |
 | credentials | object | `{"enabled":true,"secretKey":"key.json","secretName":""}` | GCP credentials configuration |
 | credentials.enabled | bool | `true` | Enable or disable the use of GCP credentials secret Set to true if you want to use a Kubernetes secret for GCP authentication Set to false to rely on other authentication methods (e.g., Workload Identity, instance metadata) |
 | credentials.secretKey | string | `"key.json"` | Key within the secret that contains the service account JSON |
@@ -136,6 +151,14 @@ serviceMonitor:
 | logLevel | string | `"info"` | Global log level, defaults to 'info' |
 | logOutputPaths | list | `["stdout"]` | Log outputPaths - defaults to stdout only |
 | nameOverride | string | `""` |  |
+| node-problem-detector | object | `{"enabled":false,"hostNetwork":true,"nodeSelector":{"karpenter.sh/capacity-type":"spot"},"resources":{"limits":{"memory":"64Mi"},"requests":{"cpu":"10m","memory":"32Mi"}},"securityContext":{"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]},"privileged":false,"readOnlyRootFilesystem":true},"tolerations":[{"operator":"Exists"}],"volume":{"localtime":{"enabled":false}}}` | Optional node-problem-detector deployment that watches the GCE metadata server for Spot preemption notices and sets the GCESpotPreempting node condition, which Karpenter's interruption controller reacts to. Pair it with `GCENodeClass.spec.preemptionNoticeDuration: 120s` for a two-minute drain window. Uses ports 20258 (Prometheus) and 20259 (server) to avoid GKE's managed detector. See docs/spot-preemption.md. |
+| node-problem-detector.enabled | bool | `false` | Deploy node-problem-detector with the Spot preemption plugin. Off by default: GKE Standard node pools already run their own node-problem-detector, so enabling this adds a second one. It only lands on nodes matching `nodeSelector`. |
+| node-problem-detector.hostNetwork | bool | `true` | Required. The plugin reads the metadata server directly, which pods cannot do through the GKE metadata server. |
+| node-problem-detector.nodeSelector | object | `{"karpenter.sh/capacity-type":"spot"}` | Only Spot nodes need the detector; on-demand instances are never preempted. |
+| node-problem-detector.resources | object | `{"limits":{"memory":"64Mi"},"requests":{"cpu":"10m","memory":"32Mi"}}` | Resource requests and limits for the detector. |
+| node-problem-detector.securityContext | object | `{"allowPrivilegeEscalation":false,"capabilities":{"drop":["ALL"]},"privileged":false,"readOnlyRootFilesystem":true}` | The plugin only needs network access, so drop the chart's default privileged pod. |
+| node-problem-detector.tolerations | list | `[{"operator":"Exists"}]` | Tolerate every taint so the detector reaches Spot nodes regardless of workload taints. |
+| node-problem-detector.volume | object | `{"localtime":{"enabled":false}}` | Not needed by the preemption plugin. |
 | podAnnotations | object | `{}` |  |
 | podDisruptionBudget.maxUnavailable | integer or string | `nil` | Maximum number of unavailable pods. When set, takes precedence over minAvailable. |
 | podDisruptionBudget.minAvailable | int | `1` | Minimum number of available pods. Used when maxUnavailable is not set. |

@@ -32,18 +32,18 @@ import (
 func init() {
 	karpv1.RestrictedLabelDomains = karpv1.RestrictedLabelDomains.Insert(RestrictedLabelDomains...)
 	karpv1.WellKnownLabels = karpv1.WellKnownLabels.Insert(
-		LabelInstanceCategory,
 		LabelInstanceFamily,
 		LabelInstanceShape,
 		LabelInstanceGeneration,
 		LabelInstanceSize,
 		LabelInstanceCPU,
-		LabelInstanceCPUModel,
 		LabelInstanceMemory,
+		LabelInstanceBareMetal,
 		LabelInstanceGPUName,
 		LabelInstanceGPUManufacturer,
 		LabelInstanceGPUCount,
 		LabelInstanceGPUMemory,
+		LabelInstanceLocalSsdCount,
 		LabelTopologyZoneID,
 		corev1.LabelWindowsBuild,
 		LabelGKEReadinessCalicoReady,
@@ -53,6 +53,8 @@ func init() {
 		LabelGKEReadinessNodeLocalDNSReady,
 		LabelGKEAccelerator,
 		LabelGKECPUScalingLevel,
+		LabelGKEGPUSharingStrategy,
+		LabelGKEMaxSharedClientsPerGPU,
 	)
 	karpv1.WellKnownLabels = karpv1.WellKnownLabels.Insert(disktype.AllLabels()...)
 }
@@ -135,21 +137,26 @@ var (
 	// LabelGKECPUScalingLevel is used by GKE's NVIDIA device-plugin DaemonSets to
 	// select the small/medium/large plugin variant for GPU nodes.
 	LabelGKECPUScalingLevel = "cloud.google.com/gke-cpu-scaling-level"
+	// LabelGKEGPUSharingStrategy and LabelGKEMaxSharedClientsPerGPU are the labels GKE
+	// puts on shared-GPU nodes. Workloads select on them to land on a shared GPU.
+	// Corresponds to GCENodeClass.spec.gpuSharingConfig.
+	LabelGKEGPUSharingStrategy     = "cloud.google.com/gke-gpu-sharing-strategy"
+	LabelGKEMaxSharedClientsPerGPU = "cloud.google.com/gke-max-shared-clients-per-gpu"
 
 	LabelNodeClass                           = apis.Group + "/gcenodeclass"
 	LabelTopologyZoneID                      = "topology.k8s.gcp/zone-id"
-	LabelInstanceCategory                    = apis.Group + "/instance-category"
 	LabelInstanceFamily                      = apis.Group + "/instance-family"
 	LabelInstanceShape                       = apis.Group + "/instance-shape"
 	LabelInstanceGeneration                  = apis.Group + "/instance-generation"
 	LabelInstanceSize                        = apis.Group + "/instance-size"
 	LabelInstanceCPU                         = apis.Group + "/instance-cpu"
-	LabelInstanceCPUModel                    = apis.Group + "/instance-cpu-model"
 	LabelInstanceMemory                      = apis.Group + "/instance-memory"
+	LabelInstanceBareMetal                   = apis.Group + "/instance-bare-metal"
 	LabelInstanceGPUName                     = apis.Group + "/instance-gpu-name"
 	LabelInstanceGPUManufacturer             = apis.Group + "/instance-gpu-manufacturer"
 	LabelInstanceGPUCount                    = apis.Group + "/instance-gpu-count"
 	LabelInstanceGPUMemory                   = apis.Group + "/instance-gpu-memory"
+	LabelInstanceLocalSsdCount               = apis.Group + "/instance-local-ssd-count"
 	AnnotationGCENodeClassHash               = apis.Group + "/gcenodeclass-hash"
 	AnnotationClusterNameTaggedCompatability = apis.CompatibilityGroup + "/cluster-name-tagged"
 	AnnotationGCENodeClassHashVersion        = apis.Group + "/gcenodeclass-hash-version"

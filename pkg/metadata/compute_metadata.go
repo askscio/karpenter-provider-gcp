@@ -17,6 +17,7 @@ limitations under the License.
 package metadata
 
 import (
+	"encoding/json"
 	"maps"
 	"sort"
 	"strings"
@@ -66,8 +67,8 @@ func NewInstanceMetadata() *InstanceMetadata {
 }
 
 // FromSourceTemplate initializes the typed model from the source template fields
-// that remain inherited. Bootstrap labels and taints are target-owned after
-// #436 and are not populated from source kube-labels or KUBELET_ARGS.
+// that remain inherited. Registration labels, taints, and shutdown configuration
+// are target-owned and are excluded from the source bootstrap values.
 func FromSourceTemplate(source *compute.Metadata) (*InstanceMetadata, error) {
 	model := NewInstanceMetadata()
 	values := metadataValuesFromCompute(source)
@@ -78,11 +79,44 @@ func FromSourceTemplate(source *compute.Metadata) (*InstanceMetadata, error) {
 	}
 	model.kubeEnv = parseKubeEnv(values[KubeEnvKey])
 	if raw := values[KubeletConfigKey]; raw != "" {
-		if err := yaml.Unmarshal([]byte(raw), &model.kubeletConfig); err != nil {
+		var err error
+		model.kubeletConfig, err = parseSourceKubeletConfig(raw)
+		if err != nil {
 			return nil, err
 		}
 	}
 	return model, nil
+}
+
+// parseSourceKubeletConfig excludes target-owned fields before typed decoding,
+// so unused source shutdown values cannot affect the target or fail parsing.
+func parseSourceKubeletConfig(raw string) (kubeletconfig.KubeletConfiguration, error) {
+	var config kubeletconfig.KubeletConfiguration
+	var fields map[string]json.RawMessage
+	if err := yaml.Unmarshal([]byte(raw), &fields); err != nil {
+		return config, err
+	}
+	delete(fields, "shutdownGracePeriod")
+	delete(fields, "shutdownGracePeriodCriticalPods")
+	delete(fields, "shutdownGracePeriodByPodPriority")
+	if rawGates, ok := fields["featureGates"]; ok {
+		var gates map[string]json.RawMessage
+		if err := json.Unmarshal(rawGates, &gates); err != nil {
+			return config, err
+		}
+		delete(gates, "GracefulNodeShutdown")
+		filteredGates, err := json.Marshal(gates)
+		if err != nil {
+			return config, err
+		}
+		fields["featureGates"] = filteredGates
+	}
+	filtered, err := json.Marshal(fields)
+	if err != nil {
+		return config, err
+	}
+	err = yaml.Unmarshal(filtered, &config)
+	return config, err
 }
 
 func (m *InstanceMetadata) SetKubeLabels(labels Labels) {
@@ -160,12 +194,8 @@ func (m *InstanceMetadata) ToComputeMetadata() (*compute.Metadata, error) {
 		return toComputeMetadata(metadataValues{}), nil
 	}
 	values := metadataValues{}
-	for key, value := range m.sourceMetadata {
-		values[key] = value
-	}
-	for key, value := range m.customMetadata {
-		values[key] = value
-	}
+	maps.Copy(values, m.sourceMetadata)
+	maps.Copy(values, m.customMetadata)
 	values[KubeEnvKey] = m.kubeEnv.String()
 	values[KubeLabelsKey] = m.kubeLabels.String()
 	rawKubeletConfig, err := yaml.Marshal(m.kubeletConfig)
@@ -184,9 +214,7 @@ func (m *InstanceMetadata) ToComputeInstanceLabels() map[string]string {
 	if m == nil {
 		return labels
 	}
-	for key, value := range m.instanceLabels {
-		labels[key] = value
-	}
+	maps.Copy(labels, m.instanceLabels)
 	return labels
 }
 

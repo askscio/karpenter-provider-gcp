@@ -23,6 +23,10 @@ import (
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 )
 
+func TestBareMetalLabelIsWellKnown(t *testing.T) {
+	require.True(t, karpv1.WellKnownLabels.Has(LabelInstanceBareMetal))
+}
+
 func TestKubeProxyReadinessLabelIsNotWellKnown(t *testing.T) {
 	require.False(t, karpv1.WellKnownLabels.Has(LabelGKEReadinessKubeProxyReady))
 }
@@ -68,4 +72,14 @@ func TestImageFamily_NoTerms_ReturnsCustom(t *testing.T) {
 		ImageSelectorTerms: []ImageSelectorTerm{{ID: "projects/p/global/images/some-image"}},
 	}}
 	require.Equal(t, ImageFamilyCustom, nc.ImageFamily())
+}
+
+func TestPodSubnetRangeNames(t *testing.T) {
+	t.Parallel()
+
+	require.Nil(t, (&GCENodeClass{}).PodSubnetRangeNames())
+
+	name := "custom"
+	require.Equal(t, []string{"custom"}, (&GCENodeClass{Spec: GCENodeClassSpec{SubnetRangeName: &name}}).PodSubnetRangeNames())
+	require.Equal(t, []string{"a", "b"}, (&GCENodeClass{Spec: GCENodeClassSpec{SubnetRangeNames: []string{"a", "b"}}}).PodSubnetRangeNames())
 }

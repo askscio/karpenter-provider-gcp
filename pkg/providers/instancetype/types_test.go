@@ -18,19 +18,25 @@ package instancetype
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
 	"cloud.google.com/go/compute/apiv1/computepb"
 	"github.com/samber/lo"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/util/sets"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 
 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/apis/v1alpha1"
 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/operator/options"
+	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/utils/localssd"
 )
 
 // TestListEphemeralStorageCacheIsolation verifies that two GCENodeClass objects
@@ -77,6 +83,101 @@ func TestListEphemeralStorageCacheIsolation(t *testing.T) {
 		"30 GiB disk should produce 15 Gi kubeReserved ephemeral-storage, not the cached 76 Gi")
 	assert.Equal(t, 2, p.staticInstanceTypesCache.ItemCount(),
 		"each distinct disk config must produce a separate cache entry")
+}
+
+func TestListCacheKeyCoversLocalSsdMode(t *testing.T) {
+	ctx := options.ToContext(context.Background(), &options.Options{VMMemoryOverheadPercent: 0.07})
+
+	p := newTestProvider()
+	raw := &v1alpha1.GCENodeClass{Spec: v1alpha1.GCENodeClassSpec{
+		LocalSsdMode: v1alpha1.LocalSSDModeRawBlock,
+	}}
+	eph := &v1alpha1.GCENodeClass{Spec: v1alpha1.GCENodeClassSpec{
+		LocalSsdMode: v1alpha1.LocalSSDModeEphemeral,
+	}}
+
+	_, err := p.List(ctx, raw)
+	assert.NoError(t, err)
+	_, err = p.List(ctx, eph)
+	assert.NoError(t, err)
+
+	assert.Equal(t, 2, p.staticInstanceTypesCache.ItemCount(),
+		"different LocalSsdMode must produce different static cache entries")
+}
+
+func TestListRequiresInstanceTypesByName(t *testing.T) {
+	ctx := options.ToContext(context.Background(), &options.Options{VMMemoryOverheadPercent: 0.07})
+	p := newTestProvider()
+	p.instanceTypesByName = nil
+
+	_, err := p.List(ctx, &v1alpha1.GCENodeClass{})
+	require.EqualError(t, err, "no instance types found")
+}
+
+func TestListDeduplicatesMachineTypesByNameBeforeVariantExpansion(t *testing.T) {
+	ctx := options.ToContext(context.Background(), &options.Options{VMMemoryOverheadPercent: 0.07})
+	p := newTestProvider()
+
+	n2 := p.instanceTypesByName["n2-standard-4"]
+	n2.Zone = lo.ToPtr("zones/us-central1-a")
+	n2.SelfLink = lo.ToPtr("projects/test-project/zones/us-central1-a/machineTypes/n2-standard-4")
+	n2Duplicate := &computepb.MachineType{
+		Name:      lo.ToPtr("n2-standard-4"),
+		GuestCpus: lo.ToPtr[int32](4),
+		MemoryMb:  lo.ToPtr[int32](16384),
+		Zone:      lo.ToPtr("zones/us-central1-b"),
+		SelfLink:  lo.ToPtr("projects/test-project/zones/us-central1-b/machineTypes/n2-standard-4"),
+	}
+	c4 := &computepb.MachineType{
+		Name:      lo.ToPtr("c4-standard-2"),
+		GuestCpus: lo.ToPtr[int32](2),
+		MemoryMb:  lo.ToPtr[int32](7680),
+	}
+	p.instanceTypesByName = indexInstanceTypesByName([]*computepb.MachineType{n2, c4, n2Duplicate})
+	p.instanceTypesOfferings["c4-standard-2"] = sets.New("us-central1-a")
+
+	instanceTypes, err := p.List(ctx, &v1alpha1.GCENodeClass{Spec: v1alpha1.GCENodeClassSpec{
+		LocalSsdMode: v1alpha1.LocalSSDModeRawBlock,
+	}})
+	require.NoError(t, err)
+	require.Len(t, instanceTypes, 1+len(ssdCountVariants(n2)))
+	assert.Equal(t, "c4-standard-2", instanceTypes[0].Name)
+	for _, it := range instanceTypes[1:] {
+		assert.Equal(t, "n2-standard-4", it.Name)
+	}
+}
+
+func TestListDeduplicatesRegionalMachineTypesByNameWithoutVariants(t *testing.T) {
+	ctx := options.ToContext(context.Background(), &options.Options{VMMemoryOverheadPercent: 0.07})
+	p := newTestProvider()
+
+	e2 := p.instanceTypesByName["n2-standard-4"]
+	e2.Name = lo.ToPtr("e2-standard-4")
+	e2.Zone = lo.ToPtr("zones/us-central1-a")
+	e2.SelfLink = lo.ToPtr("projects/test-project/zones/us-central1-a/machineTypes/e2-standard-4")
+	e2Duplicate := &computepb.MachineType{
+		Name:      lo.ToPtr("e2-standard-4"),
+		GuestCpus: lo.ToPtr[int32](4),
+		MemoryMb:  lo.ToPtr[int32](16384),
+		Zone:      lo.ToPtr("zones/us-central1-b"),
+		SelfLink:  lo.ToPtr("projects/test-project/zones/us-central1-b/machineTypes/e2-standard-4"),
+	}
+	c4 := &computepb.MachineType{
+		Name:      lo.ToPtr("c4-standard-2"),
+		GuestCpus: lo.ToPtr[int32](2),
+		MemoryMb:  lo.ToPtr[int32](7680),
+	}
+	p.instanceTypesByName = indexInstanceTypesByName([]*computepb.MachineType{e2, c4, e2Duplicate})
+	p.instanceTypesOfferings = map[string]sets.Set[string]{
+		"c4-standard-2": sets.New("us-central1-a"),
+		"e2-standard-4": sets.New("us-central1-a"),
+	}
+
+	instanceTypes, err := p.List(ctx, &v1alpha1.GCENodeClass{})
+	require.NoError(t, err)
+	require.Len(t, instanceTypes, 2)
+	assert.Equal(t, "c4-standard-2", instanceTypes[0].Name)
+	assert.Equal(t, "e2-standard-4", instanceTypes[1].Name)
 }
 
 func TestListUnavailableOfferingsDoNotGrowStaticCache(t *testing.T) {
@@ -176,7 +277,7 @@ func TestCalculateDiskConfiguration(t *testing.T) {
 		mt               *computepb.MachineType
 		expectedBootGiB  int64
 		expectedSSDGiB   int64
-		expectedSSDCount int64
+		expectedSSDCount int
 	}{
 		{
 			name: "30GiB boot disk from nodeClass (issue #220)",
@@ -227,6 +328,17 @@ func TestCalculateDiskConfiguration(t *testing.T) {
 			expectedSSDCount: 4,
 		},
 		{
+			name:      "z4d bundled partition is 3500 GiB",
+			nodeClass: &v1alpha1.GCENodeClass{},
+			mt: &computepb.MachineType{
+				Name:             lo.ToPtr("z4d-highmem-8-highlssd"),
+				BundledLocalSsds: &computepb.BundledLocalSsds{PartitionCount: lo.ToPtr[int32](1)},
+			},
+			expectedBootGiB:  100,
+			expectedSSDGiB:   3500,
+			expectedSSDCount: 1,
+		},
+		{
 			name:      "BundledLocalSsds PartitionCount=0 treated as no SSDs",
 			nodeClass: &v1alpha1.GCENodeClass{},
 			mt: &computepb.MachineType{
@@ -240,7 +352,7 @@ func TestCalculateDiskConfiguration(t *testing.T) {
 			expectedSSDCount: 0,
 		},
 		{
-			name:      "c4d-highmem-8-lssd: API reports 1 partition but total override applies",
+			name:      "c4d-highmem-8-lssd: 1 partition x 375 GiB",
 			nodeClass: &v1alpha1.GCENodeClass{},
 			mt: &computepb.MachineType{
 				Name: lo.ToPtr("c4d-highmem-8-lssd"),
@@ -249,11 +361,11 @@ func TestCalculateDiskConfiguration(t *testing.T) {
 				},
 			},
 			expectedBootGiB:  100,
-			expectedSSDGiB:   2250,
+			expectedSSDGiB:   375,
 			expectedSSDCount: 1,
 		},
 		{
-			name:      "c4d-highmem-16-lssd: API reports 1 partition but total override applies",
+			name:      "c4d-highmem-16-lssd: 1 partition x 375 GiB",
 			nodeClass: &v1alpha1.GCENodeClass{},
 			mt: &computepb.MachineType{
 				Name: lo.ToPtr("c4d-highmem-16-lssd"),
@@ -262,17 +374,251 @@ func TestCalculateDiskConfiguration(t *testing.T) {
 				},
 			},
 			expectedBootGiB:  100,
-			expectedSSDGiB:   3000,
+			expectedSSDGiB:   375,
 			expectedSSDCount: 1,
+		},
+		{
+			name:      "explicit ssdCount=2 on n2d-standard-4 → 2 × 375 GiB",
+			nodeClass: &v1alpha1.GCENodeClass{},
+			mt: &computepb.MachineType{
+				Name: lo.ToPtr("n2d-standard-4"),
+			},
+			expectedBootGiB:  100,
+			expectedSSDGiB:   750,
+			expectedSSDCount: 2,
+		},
+		{
+			name: "c4d-standard-8-lssd with custom 100 GiB boot disk",
+			nodeClass: &v1alpha1.GCENodeClass{
+				Spec: v1alpha1.GCENodeClassSpec{
+					Disks: []v1alpha1.Disk{
+						{Boot: true, SizeGiB: 100, Category: "hyperdisk-balanced"},
+					},
+				},
+			},
+			mt: &computepb.MachineType{
+				Name: lo.ToPtr("c4d-standard-8-lssd"),
+				BundledLocalSsds: &computepb.BundledLocalSsds{
+					PartitionCount: lo.ToPtr[int32](1),
+				},
+			},
+			expectedBootGiB:  100,
+			expectedSSDGiB:   375,
+			expectedSSDCount: 1,
+		},
+		{
+			name: "boot-disk entry alongside ignored legacy local-ssd entry",
+			nodeClass: &v1alpha1.GCENodeClass{
+				Spec: v1alpha1.GCENodeClassSpec{
+					Disks: []v1alpha1.Disk{
+						{Boot: true, SizeGiB: 50, Category: "pd-balanced"},
+						{Category: "local-ssd"},
+					},
+				},
+			},
+			mt: &computepb.MachineType{
+				Name: lo.ToPtr("n2d-standard-4"),
+			},
+			expectedBootGiB:  50,
+			expectedSSDGiB:   3 * 375,
+			expectedSSDCount: 3,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			bootGiB, ssdGiB, ssdCount := calculateDiskConfigGiB(tt.nodeClass, tt.mt)
-			assert.Equal(t, tt.expectedBootGiB, bootGiB, "boot disk GiB mismatch")
-			assert.Equal(t, tt.expectedSSDGiB, ssdGiB, "total SSD GiB mismatch")
-			assert.Equal(t, tt.expectedSSDCount, ssdCount, "SSD count mismatch")
+			bootDiskSwap, err := ResolveBootDiskSwap(tt.nodeClass, tt.mt.GetName(), int64(tt.mt.GetMemoryMb()))
+			require.NoError(t, err)
+			assert.Equal(t, tt.expectedBootGiB, bootDiskSwap.BootDiskGiB, "boot disk GiB mismatch")
+			assert.Equal(t, tt.expectedSSDGiB, localssd.TotalGiB(tt.mt.GetName(), tt.expectedSSDCount), "total SSD GiB mismatch")
+		})
+	}
+}
+
+func TestNewInstanceTypeGPUCount(t *testing.T) {
+	ctx := options.ToContext(context.Background(), &options.Options{VMMemoryOverheadPercent: 0.07})
+	offerings := cloudprovider.Offerings{{
+		Available: true,
+		Requirements: scheduling.NewRequirements(
+			scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, "asia-southeast1-b"),
+			scheduling.NewRequirement(karpv1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, karpv1.CapacityTypeOnDemand),
+		),
+	}}
+	oneGPU := scheduling.NewRequirements(
+		scheduling.NewRequirement(v1alpha1.LabelInstanceGPUCount, corev1.NodeSelectorOpIn, "1"),
+	)
+	for _, tc := range []struct {
+		name        string
+		machineType string
+		cpus        int32
+		counts      []int32
+		want        int64
+	}{
+		{name: "no GPUs", machineType: "n2-standard-4", cpus: 4, want: 0},
+		{name: "one GPU", machineType: "g2-standard-4", cpus: 4, counts: []int32{1}, want: 1},
+		{name: "two GPUs", machineType: "g2-standard-24", cpus: 24, counts: []int32{2}, want: 2},
+		{name: "four GPUs", machineType: "g2-standard-48", cpus: 48, counts: []int32{4}, want: 4},
+		{name: "eight GPUs", machineType: "g2-standard-96", cpus: 96, counts: []int32{8}, want: 8},
+		{name: "multiple accelerator records", machineType: "g2-standard-96", cpus: 96, counts: []int32{2, 6}, want: 8},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mt := &computepb.MachineType{
+				Name:      lo.ToPtr(tc.machineType),
+				GuestCpus: lo.ToPtr(tc.cpus),
+				MemoryMb:  lo.ToPtr(tc.cpus * 4096),
+			}
+			for _, count := range tc.counts {
+				mt.Accelerators = append(mt.Accelerators, &computepb.Accelerators{
+					GuestAcceleratorType:  lo.ToPtr("nvidia-l4"),
+					GuestAcceleratorCount: lo.ToPtr(count),
+				})
+			}
+			it := NewInstanceType(ctx, mt, &v1alpha1.GCENodeClass{}, "asia-southeast1", offerings, 0)
+			require.NotNil(t, it)
+			gpuCapacity := it.Capacity[v1alpha1.ResourceNVIDIAGPU]
+			assert.Equal(t, tc.want, gpuCapacity.Value())
+			if tc.want == 0 {
+				assert.Equal(t, corev1.NodeSelectorOpDoesNotExist, it.Requirements.Get(v1alpha1.LabelInstanceGPUCount).Operator())
+			} else {
+				assert.Equal(t, fmt.Sprint(tc.want), it.Requirements.Get(v1alpha1.LabelInstanceGPUCount).Any())
+			}
+			if tc.want == 1 {
+				assert.NoError(t, it.Requirements.Compatible(oneGPU))
+			} else {
+				assert.Error(t, it.Requirements.Compatible(oneGPU))
+			}
+		})
+	}
+}
+
+func TestNewInstanceTypeModeAware(t *testing.T) {
+	const GiB = int64(1024) * 1024 * 1024
+
+	const bootModeReservedGiB = int64(41)
+	const bootModeCapGiB = int64(100)
+
+	ctx := options.ToContext(context.Background(), &options.Options{VMMemoryOverheadPercent: 0.07})
+	offerings := cloudprovider.Offerings{{
+		Available: true,
+		Requirements: scheduling.NewRequirements(
+			scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, "us-central1-a"),
+			scheduling.NewRequirement(karpv1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, karpv1.CapacityTypeOnDemand),
+		),
+	}}
+
+	cases := []struct {
+		name            string
+		mt              *computepb.MachineType
+		mode            v1alpha1.LocalSSDMode
+		count           int
+		wantCapGiB      int64
+		wantReservedGiB int64
+	}{
+		{
+			name:            "n2d-standard-4 no SSDs default (RawBlock)",
+			mt:              &computepb.MachineType{Name: lo.ToPtr("n2d-standard-4"), GuestCpus: lo.ToPtr[int32](4), MemoryMb: lo.ToPtr[int32](16384)},
+			mode:            "",
+			count:           0,
+			wantCapGiB:      bootModeCapGiB,
+			wantReservedGiB: bootModeReservedGiB,
+		},
+		{
+			name:            "n2d-standard-4 count=2 RawBlock",
+			mt:              &computepb.MachineType{Name: lo.ToPtr("n2d-standard-4"), GuestCpus: lo.ToPtr[int32](4), MemoryMb: lo.ToPtr[int32](16384)},
+			mode:            v1alpha1.LocalSSDModeRawBlock,
+			count:           2,
+			wantCapGiB:      bootModeCapGiB,
+			wantReservedGiB: bootModeReservedGiB,
+		},
+		{
+			name:            "n2d-standard-4 count=2 Ephemeral",
+			mt:              &computepb.MachineType{Name: lo.ToPtr("n2d-standard-4"), GuestCpus: lo.ToPtr[int32](4), MemoryMb: lo.ToPtr[int32](16384)},
+			mode:            v1alpha1.LocalSSDModeEphemeral,
+			count:           2,
+			wantCapGiB:      750,
+			wantReservedGiB: 75,
+		},
+		{
+			name: "c4d-standard-8-lssd default (RawBlock) — bundled SSD ignored for capacity",
+			mt: &computepb.MachineType{
+				Name: lo.ToPtr("c4d-standard-8-lssd"), GuestCpus: lo.ToPtr[int32](8), MemoryMb: lo.ToPtr[int32](32768),
+				BundledLocalSsds: &computepb.BundledLocalSsds{PartitionCount: lo.ToPtr[int32](1)},
+			},
+			mode:            "",
+			count:           0,
+			wantCapGiB:      bootModeCapGiB,
+			wantReservedGiB: bootModeReservedGiB,
+		},
+		{
+			name: "c4d-standard-8-lssd Ephemeral",
+			mt: &computepb.MachineType{
+				Name: lo.ToPtr("c4d-standard-8-lssd"), GuestCpus: lo.ToPtr[int32](8), MemoryMb: lo.ToPtr[int32](32768),
+				BundledLocalSsds: &computepb.BundledLocalSsds{PartitionCount: lo.ToPtr[int32](1)},
+			},
+			mode:            v1alpha1.LocalSSDModeEphemeral,
+			count:           1,
+			wantCapGiB:      375,
+			wantReservedGiB: 50,
+		},
+		{
+			name: "c4d-standard-96-lssd Ephemeral (8 partitions)",
+			mt: &computepb.MachineType{
+				Name: lo.ToPtr("c4d-standard-96-lssd"), GuestCpus: lo.ToPtr[int32](96), MemoryMb: lo.ToPtr[int32](393216),
+				BundledLocalSsds: &computepb.BundledLocalSsds{PartitionCount: lo.ToPtr[int32](8)},
+			},
+			mode:            v1alpha1.LocalSSDModeEphemeral,
+			count:           8,
+			wantCapGiB:      3000,
+			wantReservedGiB: 100,
+		},
+		{
+			name: "z4d RawBlock excludes bundled SSD from ephemeral capacity",
+			mt: &computepb.MachineType{
+				Name: lo.ToPtr("z4d-highmem-8-highlssd"), GuestCpus: lo.ToPtr[int32](8), MemoryMb: lo.ToPtr[int32](64512),
+				BundledLocalSsds: &computepb.BundledLocalSsds{PartitionCount: lo.ToPtr[int32](1)},
+			},
+			mode:            v1alpha1.LocalSSDModeRawBlock,
+			count:           1,
+			wantCapGiB:      bootModeCapGiB,
+			wantReservedGiB: bootModeReservedGiB,
+		},
+		{
+			name: "z4d Ephemeral uses 3500 GiB SSD capacity",
+			mt: &computepb.MachineType{
+				Name: lo.ToPtr("z4d-highmem-8-highlssd"), GuestCpus: lo.ToPtr[int32](8), MemoryMb: lo.ToPtr[int32](64512),
+				BundledLocalSsds: &computepb.BundledLocalSsds{PartitionCount: lo.ToPtr[int32](1)},
+			},
+			mode:            v1alpha1.LocalSSDModeEphemeral,
+			count:           1,
+			wantCapGiB:      3500,
+			wantReservedGiB: 50,
+		},
+		{
+			name: "z3-highmem-88 legacy SKU Ephemeral (12 partitions × 3000 GiB)",
+			mt: &computepb.MachineType{
+				Name: lo.ToPtr("z3-highmem-88"), GuestCpus: lo.ToPtr[int32](88), MemoryMb: lo.ToPtr[int32](720896),
+				BundledLocalSsds: &computepb.BundledLocalSsds{PartitionCount: lo.ToPtr[int32](12)},
+			},
+			mode:            v1alpha1.LocalSSDModeEphemeral,
+			count:           12,
+			wantCapGiB:      36000,
+			wantReservedGiB: 100,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			nc := &v1alpha1.GCENodeClass{
+				Spec: v1alpha1.GCENodeClassSpec{
+					LocalSsdMode: tc.mode,
+				},
+			}
+			it := NewInstanceType(ctx, tc.mt, nc, "us-central1", offerings, tc.count)
+			assert.NotNil(t, it, "InstanceType should be non-nil")
+			cap := it.Capacity[corev1.ResourceEphemeralStorage]
+			res := it.Overhead.KubeReserved[corev1.ResourceEphemeralStorage]
+			assert.Equal(t, tc.wantCapGiB*GiB, cap.Value(), "ephemeral-storage capacity")
+			assert.Equal(t, tc.wantReservedGiB*GiB, res.Value(), "ephemeral-storage kubeReserved")
 		})
 	}
 }
@@ -288,7 +634,7 @@ func TestComputeRequirementsIncludesDiskTypeCompatibility(t *testing.T) {
 			scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, "us-central1-a"),
 			scheduling.NewRequirement(karpv1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, karpv1.CapacityTypeOnDemand),
 		),
-	}}, "us-central1")
+	}}, "us-central1", 0, nil)
 
 	assert.Equal(t, corev1.NodeSelectorOpIn, requirements.Get("disk-type.gke.io/pd-balanced").Operator())
 	assert.Equal(t, []string{"true"}, requirements.Get("disk-type.gke.io/pd-balanced").Values())
@@ -305,12 +651,139 @@ func TestComputeRequirementsIncludesDiskTypeCompatibility(t *testing.T) {
 	assert.Error(t, requirements.Intersects(unsupportedVolumeRequirement))
 }
 
+func TestComputeRequirementsRejectsPersistentDiskOnHyperdiskOnlyFamilies(t *testing.T) {
+	t.Parallel()
+
+	for _, name := range []string{"c4a-standard-4", "n4-standard-4"} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			requirements := computeRequirements(&computepb.MachineType{
+				Name:      lo.ToPtr(name),
+				GuestCpus: lo.ToPtr[int32](4),
+				MemoryMb:  lo.ToPtr[int32](16384),
+			}, nil, "us-central1", 0, nil)
+
+			for _, diskType := range []string{"pd-balanced", "pd-ssd"} {
+				label := "disk-type.gke.io/" + diskType
+				assert.Equal(t, corev1.NodeSelectorOpDoesNotExist, requirements.Get(label).Operator())
+				assert.Error(t, requirements.Intersects(scheduling.NewRequirements(
+					scheduling.NewRequirement(label, corev1.NodeSelectorOpIn, "true"),
+				)))
+			}
+			assert.NoError(t, requirements.Intersects(scheduling.NewRequirements(
+				scheduling.NewRequirement("disk-type.gke.io/hyperdisk-balanced", corev1.NodeSelectorOpIn, "true"),
+			)))
+		})
+	}
+}
+
+func TestZ4DDiskTypeRequirements(t *testing.T) {
+	t.Parallel()
+
+	requirements := computeRequirements(&computepb.MachineType{
+		Name:             lo.ToPtr("z4d-highmem-8-highlssd"),
+		GuestCpus:        lo.ToPtr[int32](8),
+		MemoryMb:         lo.ToPtr[int32](64512),
+		BundledLocalSsds: &computepb.BundledLocalSsds{PartitionCount: lo.ToPtr[int32](1)},
+	}, nil, "us-central1", 1, nil)
+
+	require.Equal(t, []string{"1"}, requirements.Get(v1alpha1.LabelInstanceLocalSsdCount).Values())
+	for _, diskType := range []string{"hyperdisk-balanced", "hyperdisk-balanced-high-availability", "hyperdisk-extreme", "hyperdisk-throughput", "hyperdisk-ml"} {
+		volumeRequirement := scheduling.NewRequirements(
+			scheduling.NewRequirement("disk-type.gke.io/"+diskType, corev1.NodeSelectorOpIn, "true"),
+		)
+		require.NoError(t, requirements.Intersects(volumeRequirement), diskType)
+	}
+	for _, diskType := range []string{"pd-balanced", "pd-ssd", "pd-standard", "pd-extreme"} {
+		volumeRequirement := scheduling.NewRequirements(
+			scheduling.NewRequirement("disk-type.gke.io/"+diskType, corev1.NodeSelectorOpIn, "true"),
+		)
+		require.Error(t, requirements.Intersects(volumeRequirement), diskType)
+	}
+}
+
+func TestBareMetalInstanceRequirements(t *testing.T) {
+	ctx := options.ToContext(context.Background(), &options.Options{VMMemoryOverheadPercent: 0.07})
+	tests := []struct {
+		name      string
+		bareMetal string
+	}{
+		{name: "c4a-highmem-96-metal", bareMetal: "true"},
+		{name: "c4a-highmem-96", bareMetal: "false"},
+		{name: "c4-standard-288-metal", bareMetal: "true"},
+		{name: "c4-standard-288", bareMetal: "false"},
+		{name: "c4-standard-288-lssd-metal", bareMetal: "true"},
+		{name: "c4-standard-288-lssd", bareMetal: "false"},
+		{name: "z3-highmem-192-highlssd-metal", bareMetal: "true"},
+		{name: "n2-custom-4-16384", bareMetal: "false"},
+		{name: "a4x-maxgpu-4g-metal", bareMetal: "true"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			mt := &computepb.MachineType{
+				Name:      lo.ToPtr(tt.name),
+				GuestCpus: lo.ToPtr[int32](96),
+				MemoryMb:  lo.ToPtr[int32](768 * 1024),
+			}
+			it := NewInstanceType(ctx, mt, &v1alpha1.GCENodeClass{}, "us-central1", testOfferings(), 0)
+			require.NotNil(t, it)
+			require.Equal(t, []string{tt.bareMetal}, it.Requirements.Get(v1alpha1.LabelInstanceBareMetal).Values())
+			require.Equal(t, []string{"96"}, it.Requirements.Get(v1alpha1.LabelInstanceCPU).Values(),
+				"metal selection must not change the CPU selector")
+			require.Equal(t, []string{strings.Split(tt.name, "-")[0]}, it.Requirements.Get(v1alpha1.LabelInstanceFamily).Values())
+			require.NoError(t, it.Requirements.Compatible(scheduling.NewRequirements()),
+				"pools without a bare-metal requirement must retain both VMs and metal")
+			for _, value := range []string{"true", "false"} {
+				req := scheduling.NewRequirements(scheduling.NewRequirement(v1alpha1.LabelInstanceBareMetal, corev1.NodeSelectorOpIn, value))
+				require.Equal(t, tt.bareMetal == value, it.Requirements.IsCompatible(req))
+			}
+			excludeMetal := scheduling.NewRequirements(scheduling.NewRequirement(v1alpha1.LabelInstanceBareMetal, corev1.NodeSelectorOpNotIn, "true"))
+			require.Equal(t, tt.bareMetal == "false", it.Requirements.IsCompatible(excludeMetal))
+		})
+	}
+}
+
+func TestBareMetalRequirementLegacyCompatibility(t *testing.T) {
+	tests := []struct {
+		name   string
+		labels map[string]string
+		want   []bool
+	}{
+		{name: "legacy node without label", labels: map[string]string{}, want: []bool{false, false, true}},
+		{name: "virtual machine", labels: map[string]string{v1alpha1.LabelInstanceBareMetal: "false"}, want: []bool{true, false, true}},
+		{name: "bare metal", labels: map[string]string{v1alpha1.LabelInstanceBareMetal: "true"}, want: []bool{false, true, false}},
+	}
+	selectors := []struct {
+		name     string
+		operator corev1.NodeSelectorOperator
+		value    string
+	}{
+		{name: "require VM", operator: corev1.NodeSelectorOpIn, value: "false"},
+		{name: "require metal", operator: corev1.NodeSelectorOpIn, value: "true"},
+		{name: "exclude labeled metal", operator: corev1.NodeSelectorOpNotIn, value: "true"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			labels := scheduling.NewLabelRequirements(tt.labels)
+			for i, selector := range selectors {
+				t.Run(selector.name, func(t *testing.T) {
+					req := scheduling.NewRequirements(scheduling.NewRequirement(v1alpha1.LabelInstanceBareMetal, selector.operator, selector.value))
+					require.Equal(t, tt.want[i], labels.IsCompatible(req),
+						"drift compares persisted labels, so positive selectors reject unlabeled legacy VMs too")
+				})
+			}
+		})
+	}
+}
+
 func TestComputeRequirements(t *testing.T) {
 	tests := []struct {
 		name      string
 		mt        *computepb.MachineType
 		offerings cloudprovider.Offerings
 		region    string
+		ssdCount  int
 		expected  scheduling.Requirements
 	}{
 		{
@@ -340,9 +813,7 @@ func TestComputeRequirements(t *testing.T) {
 				scheduling.NewRequirement(corev1.LabelWindowsBuild, corev1.NodeSelectorOpDoesNotExist),
 				scheduling.NewRequirement(karpv1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, karpv1.CapacityTypeOnDemand),
 				scheduling.NewRequirement(v1alpha1.LabelInstanceCPU, corev1.NodeSelectorOpIn, "1"),
-				scheduling.NewRequirement(v1alpha1.LabelInstanceCPUModel, corev1.NodeSelectorOpDoesNotExist),
 				scheduling.NewRequirement(v1alpha1.LabelInstanceMemory, corev1.NodeSelectorOpIn, "3840"),
-				scheduling.NewRequirement(v1alpha1.LabelInstanceCategory, corev1.NodeSelectorOpIn, "n"),
 				scheduling.NewRequirement(v1alpha1.LabelInstanceFamily, corev1.NodeSelectorOpIn, "n1"),
 				scheduling.NewRequirement(v1alpha1.LabelInstanceShape, corev1.NodeSelectorOpIn, "standard"),
 				scheduling.NewRequirement(v1alpha1.LabelInstanceGeneration, corev1.NodeSelectorOpIn, "1"),
@@ -353,6 +824,7 @@ func TestComputeRequirements(t *testing.T) {
 				scheduling.NewRequirement(v1alpha1.LabelInstanceGPUMemory, corev1.NodeSelectorOpDoesNotExist),
 				scheduling.NewRequirement(v1alpha1.LabelGKEAccelerator, corev1.NodeSelectorOpDoesNotExist),
 				scheduling.NewRequirement(corev1.LabelArchStable, corev1.NodeSelectorOpIn, "amd64"),
+				scheduling.NewRequirement(v1alpha1.LabelInstanceLocalSsdCount, corev1.NodeSelectorOpIn, "0"),
 			),
 		},
 		{
@@ -381,9 +853,7 @@ func TestComputeRequirements(t *testing.T) {
 				scheduling.NewRequirement(corev1.LabelWindowsBuild, corev1.NodeSelectorOpDoesNotExist),
 				scheduling.NewRequirement(karpv1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, karpv1.CapacityTypeSpot),
 				scheduling.NewRequirement(v1alpha1.LabelInstanceCPU, corev1.NodeSelectorOpIn, "1"),
-				scheduling.NewRequirement(v1alpha1.LabelInstanceCPUModel, corev1.NodeSelectorOpDoesNotExist),
 				scheduling.NewRequirement(v1alpha1.LabelInstanceMemory, corev1.NodeSelectorOpIn, "4096"),
-				scheduling.NewRequirement(v1alpha1.LabelInstanceCategory, corev1.NodeSelectorOpIn, "t"),
 				scheduling.NewRequirement(v1alpha1.LabelInstanceFamily, corev1.NodeSelectorOpIn, "t2a"),
 				scheduling.NewRequirement(v1alpha1.LabelInstanceShape, corev1.NodeSelectorOpIn, "standard"),
 				scheduling.NewRequirement(v1alpha1.LabelInstanceGeneration, corev1.NodeSelectorOpIn, "2"),
@@ -392,7 +862,9 @@ func TestComputeRequirements(t *testing.T) {
 				scheduling.NewRequirement(v1alpha1.LabelInstanceGPUManufacturer, corev1.NodeSelectorOpDoesNotExist),
 				scheduling.NewRequirement(v1alpha1.LabelInstanceGPUCount, corev1.NodeSelectorOpDoesNotExist),
 				scheduling.NewRequirement(v1alpha1.LabelInstanceGPUMemory, corev1.NodeSelectorOpDoesNotExist),
+				scheduling.NewRequirement(v1alpha1.LabelGKEAccelerator, corev1.NodeSelectorOpDoesNotExist),
 				scheduling.NewRequirement(corev1.LabelArchStable, corev1.NodeSelectorOpIn, "arm64"),
+				scheduling.NewRequirement(v1alpha1.LabelInstanceLocalSsdCount, corev1.NodeSelectorOpIn, "0"),
 			),
 		},
 		{
@@ -426,9 +898,7 @@ func TestComputeRequirements(t *testing.T) {
 				scheduling.NewRequirement(corev1.LabelWindowsBuild, corev1.NodeSelectorOpDoesNotExist),
 				scheduling.NewRequirement(karpv1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, karpv1.CapacityTypeOnDemand),
 				scheduling.NewRequirement(v1alpha1.LabelInstanceCPU, corev1.NodeSelectorOpIn, "12"),
-				scheduling.NewRequirement(v1alpha1.LabelInstanceCPUModel, corev1.NodeSelectorOpDoesNotExist),
 				scheduling.NewRequirement(v1alpha1.LabelInstanceMemory, corev1.NodeSelectorOpIn, "86016"),
-				scheduling.NewRequirement(v1alpha1.LabelInstanceCategory, corev1.NodeSelectorOpIn, "a"),
 				scheduling.NewRequirement(v1alpha1.LabelInstanceFamily, corev1.NodeSelectorOpIn, "a2"),
 				scheduling.NewRequirement(v1alpha1.LabelInstanceShape, corev1.NodeSelectorOpIn, "highgpu"),
 				scheduling.NewRequirement(v1alpha1.LabelInstanceGeneration, corev1.NodeSelectorOpIn, "2"),
@@ -439,6 +909,7 @@ func TestComputeRequirements(t *testing.T) {
 				scheduling.NewRequirement(v1alpha1.LabelInstanceGPUMemory, corev1.NodeSelectorOpDoesNotExist),
 				scheduling.NewRequirement(v1alpha1.LabelGKEAccelerator, corev1.NodeSelectorOpIn, "nvidia-tesla-a100"),
 				scheduling.NewRequirement(corev1.LabelArchStable, corev1.NodeSelectorOpIn, "amd64"),
+				scheduling.NewRequirement(v1alpha1.LabelInstanceLocalSsdCount, corev1.NodeSelectorOpIn, "0"),
 			),
 		},
 		{
@@ -466,9 +937,7 @@ func TestComputeRequirements(t *testing.T) {
 				scheduling.NewRequirement(corev1.LabelWindowsBuild, corev1.NodeSelectorOpDoesNotExist),
 				scheduling.NewRequirement(karpv1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, karpv1.CapacityTypeOnDemand),
 				scheduling.NewRequirement(v1alpha1.LabelInstanceCPU, corev1.NodeSelectorOpIn, "2"),
-				scheduling.NewRequirement(v1alpha1.LabelInstanceCPUModel, corev1.NodeSelectorOpDoesNotExist),
 				scheduling.NewRequirement(v1alpha1.LabelInstanceMemory, corev1.NodeSelectorOpIn, "4096"),
-				scheduling.NewRequirement(v1alpha1.LabelInstanceCategory, corev1.NodeSelectorOpIn, "e"),
 				scheduling.NewRequirement(v1alpha1.LabelInstanceFamily, corev1.NodeSelectorOpIn, "e2"),
 				scheduling.NewRequirement(v1alpha1.LabelInstanceShape, corev1.NodeSelectorOpIn, "medium"),
 				scheduling.NewRequirement(v1alpha1.LabelInstanceGeneration, corev1.NodeSelectorOpIn, "2"),
@@ -479,6 +948,7 @@ func TestComputeRequirements(t *testing.T) {
 				scheduling.NewRequirement(v1alpha1.LabelInstanceGPUMemory, corev1.NodeSelectorOpDoesNotExist),
 				scheduling.NewRequirement(v1alpha1.LabelGKEAccelerator, corev1.NodeSelectorOpDoesNotExist),
 				scheduling.NewRequirement(corev1.LabelArchStable, corev1.NodeSelectorOpIn, "amd64"),
+				scheduling.NewRequirement(v1alpha1.LabelInstanceLocalSsdCount, corev1.NodeSelectorOpIn, "0"),
 			),
 		},
 		{
@@ -507,9 +977,7 @@ func TestComputeRequirements(t *testing.T) {
 				scheduling.NewRequirement(corev1.LabelWindowsBuild, corev1.NodeSelectorOpDoesNotExist),
 				scheduling.NewRequirement(karpv1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, karpv1.CapacityTypeOnDemand),
 				scheduling.NewRequirement(v1alpha1.LabelInstanceCPU, corev1.NodeSelectorOpIn, "1"),
-				scheduling.NewRequirement(v1alpha1.LabelInstanceCPUModel, corev1.NodeSelectorOpDoesNotExist),
 				scheduling.NewRequirement(v1alpha1.LabelInstanceMemory, corev1.NodeSelectorOpIn, "3840"),
-				scheduling.NewRequirement(v1alpha1.LabelInstanceCategory, corev1.NodeSelectorOpIn, "n"),
 				scheduling.NewRequirement(v1alpha1.LabelInstanceFamily, corev1.NodeSelectorOpIn, "n1"),
 				scheduling.NewRequirement(v1alpha1.LabelInstanceShape, corev1.NodeSelectorOpIn, "standard"),
 				scheduling.NewRequirement(v1alpha1.LabelInstanceGeneration, corev1.NodeSelectorOpIn, "1"),
@@ -520,15 +988,18 @@ func TestComputeRequirements(t *testing.T) {
 				scheduling.NewRequirement(v1alpha1.LabelInstanceGPUMemory, corev1.NodeSelectorOpDoesNotExist),
 				scheduling.NewRequirement(v1alpha1.LabelGKEAccelerator, corev1.NodeSelectorOpDoesNotExist),
 				scheduling.NewRequirement(corev1.LabelArchStable, corev1.NodeSelectorOpIn, "amd64"),
+				scheduling.NewRequirement(v1alpha1.LabelInstanceLocalSsdCount, corev1.NodeSelectorOpIn, "0"),
 			),
 		},
 		{
 			name: "GPU Instance (c3d-highmem-8-lssd)",
 			mt: &computepb.MachineType{
-				Name:      lo.ToPtr("c3d-highmem-8-lssd"),
-				GuestCpus: lo.ToPtr[int32](8),
-				MemoryMb:  lo.ToPtr[int32](65536),
+				Name:             lo.ToPtr("c3d-highmem-8-lssd"),
+				GuestCpus:        lo.ToPtr[int32](8),
+				MemoryMb:         lo.ToPtr[int32](65536),
+				BundledLocalSsds: &computepb.BundledLocalSsds{PartitionCount: lo.ToPtr[int32](1)},
 			},
+			ssdCount: 1,
 			offerings: cloudprovider.Offerings{
 				{
 					Available: true,
@@ -547,9 +1018,7 @@ func TestComputeRequirements(t *testing.T) {
 				scheduling.NewRequirement(corev1.LabelWindowsBuild, corev1.NodeSelectorOpDoesNotExist),
 				scheduling.NewRequirement(karpv1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, karpv1.CapacityTypeOnDemand),
 				scheduling.NewRequirement(v1alpha1.LabelInstanceCPU, corev1.NodeSelectorOpIn, "8"),
-				scheduling.NewRequirement(v1alpha1.LabelInstanceCPUModel, corev1.NodeSelectorOpDoesNotExist),
 				scheduling.NewRequirement(v1alpha1.LabelInstanceMemory, corev1.NodeSelectorOpIn, "65536"),
-				scheduling.NewRequirement(v1alpha1.LabelInstanceCategory, corev1.NodeSelectorOpIn, "c"),
 				scheduling.NewRequirement(v1alpha1.LabelInstanceFamily, corev1.NodeSelectorOpIn, "c3d"),
 				scheduling.NewRequirement(v1alpha1.LabelInstanceShape, corev1.NodeSelectorOpIn, "highmem"),
 				scheduling.NewRequirement(v1alpha1.LabelInstanceGeneration, corev1.NodeSelectorOpIn, "3"),
@@ -560,19 +1029,188 @@ func TestComputeRequirements(t *testing.T) {
 				scheduling.NewRequirement(v1alpha1.LabelInstanceGPUMemory, corev1.NodeSelectorOpDoesNotExist),
 				scheduling.NewRequirement(v1alpha1.LabelGKEAccelerator, corev1.NodeSelectorOpDoesNotExist),
 				scheduling.NewRequirement(corev1.LabelArchStable, corev1.NodeSelectorOpIn, "amd64"),
+				scheduling.NewRequirement(v1alpha1.LabelInstanceLocalSsdCount, corev1.NodeSelectorOpIn, "1"),
+			),
+		},
+		{
+			name: "Configurable family with no SSDs (n2d-standard-8)",
+			mt: &computepb.MachineType{
+				Name:      lo.ToPtr("n2d-standard-8"),
+				GuestCpus: lo.ToPtr[int32](8),
+				MemoryMb:  lo.ToPtr[int32](32768),
+			},
+			offerings: cloudprovider.Offerings{
+				{
+					Available: true,
+					Requirements: scheduling.NewRequirements(
+						scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, "us-central1-a"),
+						scheduling.NewRequirement(karpv1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, karpv1.CapacityTypeOnDemand),
+					),
+				},
+			},
+			region: "us-central1",
+			expected: scheduling.NewRequirements(
+				scheduling.NewRequirement(corev1.LabelInstanceTypeStable, corev1.NodeSelectorOpIn, "n2d-standard-8"),
+				scheduling.NewRequirement(corev1.LabelOSStable, corev1.NodeSelectorOpIn, "linux"),
+				scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, "us-central1-a"),
+				scheduling.NewRequirement(corev1.LabelTopologyRegion, corev1.NodeSelectorOpIn, "us-central1"),
+				scheduling.NewRequirement(corev1.LabelWindowsBuild, corev1.NodeSelectorOpDoesNotExist),
+				scheduling.NewRequirement(karpv1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, karpv1.CapacityTypeOnDemand),
+				scheduling.NewRequirement(v1alpha1.LabelInstanceCPU, corev1.NodeSelectorOpIn, "8"),
+				scheduling.NewRequirement(v1alpha1.LabelInstanceMemory, corev1.NodeSelectorOpIn, "32768"),
+				scheduling.NewRequirement(v1alpha1.LabelInstanceFamily, corev1.NodeSelectorOpIn, "n2d"),
+				scheduling.NewRequirement(v1alpha1.LabelInstanceShape, corev1.NodeSelectorOpIn, "standard"),
+				scheduling.NewRequirement(v1alpha1.LabelInstanceGeneration, corev1.NodeSelectorOpIn, "2"),
+				scheduling.NewRequirement(v1alpha1.LabelInstanceSize, corev1.NodeSelectorOpIn, "8"),
+				scheduling.NewRequirement(v1alpha1.LabelInstanceGPUName, corev1.NodeSelectorOpDoesNotExist),
+				scheduling.NewRequirement(v1alpha1.LabelInstanceGPUManufacturer, corev1.NodeSelectorOpDoesNotExist),
+				scheduling.NewRequirement(v1alpha1.LabelInstanceGPUCount, corev1.NodeSelectorOpDoesNotExist),
+				scheduling.NewRequirement(v1alpha1.LabelInstanceGPUMemory, corev1.NodeSelectorOpDoesNotExist),
+				scheduling.NewRequirement(v1alpha1.LabelGKEAccelerator, corev1.NodeSelectorOpDoesNotExist),
+				scheduling.NewRequirement(corev1.LabelArchStable, corev1.NodeSelectorOpIn, "amd64"),
+				scheduling.NewRequirement(v1alpha1.LabelInstanceLocalSsdCount, corev1.NodeSelectorOpIn, "0"),
+			),
+		},
+		{
+			name: "Mixed-family non-bundled (c4a-standard-4)",
+			mt: &computepb.MachineType{
+				Name:         lo.ToPtr("c4a-standard-4"),
+				GuestCpus:    lo.ToPtr[int32](4),
+				MemoryMb:     lo.ToPtr[int32](16384),
+				Architecture: lo.ToPtr("ARM64"),
+			},
+			offerings: cloudprovider.Offerings{
+				{
+					Available: true,
+					Requirements: scheduling.NewRequirements(
+						scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, "us-central1-a"),
+						scheduling.NewRequirement(karpv1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, karpv1.CapacityTypeOnDemand),
+					),
+				},
+			},
+			region: "us-central1",
+			expected: scheduling.NewRequirements(
+				scheduling.NewRequirement(corev1.LabelInstanceTypeStable, corev1.NodeSelectorOpIn, "c4a-standard-4"),
+				scheduling.NewRequirement(corev1.LabelOSStable, corev1.NodeSelectorOpIn, "linux"),
+				scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, "us-central1-a"),
+				scheduling.NewRequirement(corev1.LabelTopologyRegion, corev1.NodeSelectorOpIn, "us-central1"),
+				scheduling.NewRequirement(corev1.LabelWindowsBuild, corev1.NodeSelectorOpDoesNotExist),
+				scheduling.NewRequirement(karpv1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, karpv1.CapacityTypeOnDemand),
+				scheduling.NewRequirement(v1alpha1.LabelInstanceCPU, corev1.NodeSelectorOpIn, "4"),
+				scheduling.NewRequirement(v1alpha1.LabelInstanceMemory, corev1.NodeSelectorOpIn, "16384"),
+				scheduling.NewRequirement(v1alpha1.LabelInstanceFamily, corev1.NodeSelectorOpIn, "c4a"),
+				scheduling.NewRequirement(v1alpha1.LabelInstanceShape, corev1.NodeSelectorOpIn, "standard"),
+				scheduling.NewRequirement(v1alpha1.LabelInstanceGeneration, corev1.NodeSelectorOpIn, "4"),
+				scheduling.NewRequirement(v1alpha1.LabelInstanceSize, corev1.NodeSelectorOpIn, "4"),
+				scheduling.NewRequirement(v1alpha1.LabelInstanceGPUName, corev1.NodeSelectorOpDoesNotExist),
+				scheduling.NewRequirement(v1alpha1.LabelInstanceGPUManufacturer, corev1.NodeSelectorOpDoesNotExist),
+				scheduling.NewRequirement(v1alpha1.LabelInstanceGPUCount, corev1.NodeSelectorOpDoesNotExist),
+				scheduling.NewRequirement(v1alpha1.LabelInstanceGPUMemory, corev1.NodeSelectorOpDoesNotExist),
+				scheduling.NewRequirement(v1alpha1.LabelGKEAccelerator, corev1.NodeSelectorOpDoesNotExist),
+				scheduling.NewRequirement(corev1.LabelArchStable, corev1.NodeSelectorOpIn, "arm64"),
+				scheduling.NewRequirement(v1alpha1.LabelInstanceLocalSsdCount, corev1.NodeSelectorOpIn, "0"),
+			),
+		},
+		{
+			name: "Mixed-family bundled (c4a-standard-4-lssd)",
+			mt: &computepb.MachineType{
+				Name:             lo.ToPtr("c4a-standard-4-lssd"),
+				GuestCpus:        lo.ToPtr[int32](4),
+				MemoryMb:         lo.ToPtr[int32](16384),
+				Architecture:     lo.ToPtr("ARM64"),
+				BundledLocalSsds: &computepb.BundledLocalSsds{PartitionCount: lo.ToPtr[int32](1)},
+			},
+			ssdCount: 1,
+			offerings: cloudprovider.Offerings{
+				{
+					Available: true,
+					Requirements: scheduling.NewRequirements(
+						scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, "us-central1-a"),
+						scheduling.NewRequirement(karpv1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, karpv1.CapacityTypeOnDemand),
+					),
+				},
+			},
+			region: "us-central1",
+			expected: scheduling.NewRequirements(
+				scheduling.NewRequirement(corev1.LabelInstanceTypeStable, corev1.NodeSelectorOpIn, "c4a-standard-4-lssd"),
+				scheduling.NewRequirement(corev1.LabelOSStable, corev1.NodeSelectorOpIn, "linux"),
+				scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, "us-central1-a"),
+				scheduling.NewRequirement(corev1.LabelTopologyRegion, corev1.NodeSelectorOpIn, "us-central1"),
+				scheduling.NewRequirement(corev1.LabelWindowsBuild, corev1.NodeSelectorOpDoesNotExist),
+				scheduling.NewRequirement(karpv1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, karpv1.CapacityTypeOnDemand),
+				scheduling.NewRequirement(v1alpha1.LabelInstanceCPU, corev1.NodeSelectorOpIn, "4"),
+				scheduling.NewRequirement(v1alpha1.LabelInstanceMemory, corev1.NodeSelectorOpIn, "16384"),
+				scheduling.NewRequirement(v1alpha1.LabelInstanceFamily, corev1.NodeSelectorOpIn, "c4a"),
+				scheduling.NewRequirement(v1alpha1.LabelInstanceShape, corev1.NodeSelectorOpIn, "standard"),
+				scheduling.NewRequirement(v1alpha1.LabelInstanceGeneration, corev1.NodeSelectorOpIn, "4"),
+				scheduling.NewRequirement(v1alpha1.LabelInstanceSize, corev1.NodeSelectorOpIn, "4"),
+				scheduling.NewRequirement(v1alpha1.LabelInstanceGPUName, corev1.NodeSelectorOpDoesNotExist),
+				scheduling.NewRequirement(v1alpha1.LabelInstanceGPUManufacturer, corev1.NodeSelectorOpDoesNotExist),
+				scheduling.NewRequirement(v1alpha1.LabelInstanceGPUCount, corev1.NodeSelectorOpDoesNotExist),
+				scheduling.NewRequirement(v1alpha1.LabelInstanceGPUMemory, corev1.NodeSelectorOpDoesNotExist),
+				scheduling.NewRequirement(v1alpha1.LabelGKEAccelerator, corev1.NodeSelectorOpDoesNotExist),
+				scheduling.NewRequirement(corev1.LabelArchStable, corev1.NodeSelectorOpIn, "arm64"),
+				scheduling.NewRequirement(v1alpha1.LabelInstanceLocalSsdCount, corev1.NodeSelectorOpIn, "1"),
+			),
+		},
+		{
+			name: "Bundled SSDs (z3-highmem-22-standardlssd)",
+			mt: &computepb.MachineType{
+				Name:             lo.ToPtr("z3-highmem-22-standardlssd"),
+				GuestCpus:        lo.ToPtr[int32](22),
+				MemoryMb:         lo.ToPtr[int32](180224),
+				BundledLocalSsds: &computepb.BundledLocalSsds{PartitionCount: lo.ToPtr[int32](2)},
+			},
+			ssdCount: 2,
+			offerings: cloudprovider.Offerings{
+				{
+					Available: true,
+					Requirements: scheduling.NewRequirements(
+						scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, "us-central1-a"),
+						scheduling.NewRequirement(karpv1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, karpv1.CapacityTypeOnDemand),
+					),
+				},
+			},
+			region: "us-central1",
+			expected: scheduling.NewRequirements(
+				scheduling.NewRequirement(corev1.LabelInstanceTypeStable, corev1.NodeSelectorOpIn, "z3-highmem-22-standardlssd"),
+				scheduling.NewRequirement(corev1.LabelOSStable, corev1.NodeSelectorOpIn, "linux"),
+				scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, "us-central1-a"),
+				scheduling.NewRequirement(corev1.LabelTopologyRegion, corev1.NodeSelectorOpIn, "us-central1"),
+				scheduling.NewRequirement(corev1.LabelWindowsBuild, corev1.NodeSelectorOpDoesNotExist),
+				scheduling.NewRequirement(karpv1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, karpv1.CapacityTypeOnDemand),
+				scheduling.NewRequirement(v1alpha1.LabelInstanceCPU, corev1.NodeSelectorOpIn, "22"),
+				scheduling.NewRequirement(v1alpha1.LabelInstanceMemory, corev1.NodeSelectorOpIn, "180224"),
+				scheduling.NewRequirement(v1alpha1.LabelInstanceFamily, corev1.NodeSelectorOpIn, "z3"),
+				scheduling.NewRequirement(v1alpha1.LabelInstanceShape, corev1.NodeSelectorOpIn, "highmem"),
+				scheduling.NewRequirement(v1alpha1.LabelInstanceGeneration, corev1.NodeSelectorOpIn, "3"),
+				scheduling.NewRequirement(v1alpha1.LabelInstanceSize, corev1.NodeSelectorOpIn, "22"),
+				scheduling.NewRequirement(v1alpha1.LabelInstanceGPUName, corev1.NodeSelectorOpDoesNotExist),
+				scheduling.NewRequirement(v1alpha1.LabelInstanceGPUManufacturer, corev1.NodeSelectorOpDoesNotExist),
+				scheduling.NewRequirement(v1alpha1.LabelInstanceGPUCount, corev1.NodeSelectorOpDoesNotExist),
+				scheduling.NewRequirement(v1alpha1.LabelInstanceGPUMemory, corev1.NodeSelectorOpDoesNotExist),
+				scheduling.NewRequirement(v1alpha1.LabelGKEAccelerator, corev1.NodeSelectorOpDoesNotExist),
+				scheduling.NewRequirement(corev1.LabelArchStable, corev1.NodeSelectorOpIn, "amd64"),
+				scheduling.NewRequirement(v1alpha1.LabelInstanceLocalSsdCount, corev1.NodeSelectorOpIn, "2"),
 			),
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := computeRequirements(tt.mt, tt.offerings, tt.region)
+			tt.expected.Add(scheduling.NewRequirement(v1alpha1.LabelInstanceBareMetal, corev1.NodeSelectorOpIn, "false"))
+			tt.expected.Add(scheduling.NewRequirement(v1alpha1.LabelGKEGPUSharingStrategy, corev1.NodeSelectorOpDoesNotExist))
+			tt.expected.Add(scheduling.NewRequirement(v1alpha1.LabelGKEMaxSharedClientsPerGPU, corev1.NodeSelectorOpDoesNotExist))
+			got := computeRequirements(tt.mt, tt.offerings, tt.region, tt.ssdCount, nil)
 
 			// Validate keys present in got
 			for key := range got {
-				if tt.expected.Get(key) == nil {
+				if _, ok := tt.expected[key]; !ok {
 					// Ignore LabelTopologyZoneID if it wasn't expected (due to auto-generation with random values)
 					if key == v1alpha1.LabelTopologyZoneID {
+						continue
+					}
+					if strings.HasPrefix(key, "disk-type.gke.io/") {
 						continue
 					}
 					t.Errorf("Unexpected key in result: %s", key)
@@ -592,4 +1230,399 @@ func TestComputeRequirements(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSSDCountVariantsAscending(t *testing.T) {
+	cases := []struct {
+		name string
+		mt   *computepb.MachineType
+		want []int
+	}{
+		{
+			name: "configurable n2d at top-of-family vCPU bracket",
+			mt:   &computepb.MachineType{Name: lo.ToPtr("n2d-standard-8"), GuestCpus: lo.ToPtr[int32](8)},
+			want: []int{0, 1, 2, 4, 8, 16, 24},
+		},
+		{
+			name: "configurable n2 at lower vCPU bracket",
+			mt:   &computepb.MachineType{Name: lo.ToPtr("n2-standard-2"), GuestCpus: lo.ToPtr[int32](2)},
+			want: []int{0, 1, 2, 4, 8, 16, 24},
+		},
+		{
+			name: "configurable c2 small bracket",
+			mt:   &computepb.MachineType{Name: lo.ToPtr("c2-standard-4"), GuestCpus: lo.ToPtr[int32](4)},
+			want: []int{0, 1, 2, 4, 8},
+		},
+		{
+			name: "bundled SKU emits the pinned count, no zero",
+			mt: &computepb.MachineType{
+				Name:             lo.ToPtr("c4d-standard-8-lssd"),
+				GuestCpus:        lo.ToPtr[int32](8),
+				BundledLocalSsds: &computepb.BundledLocalSsds{PartitionCount: lo.ToPtr[int32](1)},
+			},
+			want: []int{1},
+		},
+		{
+			name: "no-SSD-only family emits {0}",
+			mt:   &computepb.MachineType{Name: lo.ToPtr("e2-medium"), GuestCpus: lo.ToPtr[int32](2)},
+			want: []int{0},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ssdCountVariants(tc.mt)
+			assert.Equal(t, tc.want, got, "variant slice mismatch")
+			for i := 1; i < len(got); i++ {
+				assert.Less(t, got[i-1], got[i],
+					"emission must be strictly ascending; %v has %d before %d at index %d",
+					got, got[i-1], got[i], i)
+			}
+		})
+	}
+}
+
+func TestNewInstanceTypeGPUTimeSharing(t *testing.T) {
+	ctx := options.ToContext(context.Background(), &options.Options{VMMemoryOverheadPercent: 0.07})
+	nodeClass := &v1alpha1.GCENodeClass{Spec: v1alpha1.GCENodeClassSpec{GPUSharingConfig: &v1alpha1.GPUSharingConfig{
+		Strategy:               v1alpha1.GPUSharingStrategyTimeSharing,
+		MaxSharedClientsPerGPU: 4,
+	}}}
+	offerings := cloudprovider.Offerings{{
+		Available: true,
+		Requirements: scheduling.NewRequirements(
+			scheduling.NewRequirement(corev1.LabelTopologyZone, corev1.NodeSelectorOpIn, "us-central1-a"),
+			scheduling.NewRequirement(karpv1.CapacityTypeLabelKey, corev1.NodeSelectorOpIn, karpv1.CapacityTypeOnDemand),
+		),
+	}}
+	sharedSelector := scheduling.NewRequirements(
+		scheduling.NewRequirement(v1alpha1.LabelGKEGPUSharingStrategy, corev1.NodeSelectorOpIn, "time-sharing"),
+		scheduling.NewRequirement(v1alpha1.LabelGKEMaxSharedClientsPerGPU, corev1.NodeSelectorOpIn, "4"),
+	)
+
+	t.Run("GPU machine advertises shared capacity", func(t *testing.T) {
+		mt := &computepb.MachineType{
+			Name:      lo.ToPtr("g2-standard-24"),
+			GuestCpus: lo.ToPtr[int32](24),
+			MemoryMb:  lo.ToPtr[int32](98304),
+			Accelerators: []*computepb.Accelerators{{
+				GuestAcceleratorType:  lo.ToPtr("nvidia-l4"),
+				GuestAcceleratorCount: lo.ToPtr[int32](2),
+			}},
+		}
+		it := NewInstanceType(ctx, mt, nodeClass, "us-central1", offerings, 0)
+		require.NotNil(t, it)
+		gpuCapacity := it.Capacity[v1alpha1.ResourceNVIDIAGPU]
+		assert.Equal(t, int64(8), gpuCapacity.Value())
+		assert.Equal(t, "2", it.Requirements.Get(v1alpha1.LabelInstanceGPUCount).Any())
+		assert.NoError(t, it.Requirements.Compatible(sharedSelector))
+	})
+
+	t.Run("non-GPU machine ignores sharing", func(t *testing.T) {
+		mt := &computepb.MachineType{
+			Name:      lo.ToPtr("n2-standard-4"),
+			GuestCpus: lo.ToPtr[int32](4),
+			MemoryMb:  lo.ToPtr[int32](16384),
+		}
+		it := NewInstanceType(ctx, mt, nodeClass, "us-central1", offerings, 0)
+		require.NotNil(t, it)
+		gpuCapacity := it.Capacity[v1alpha1.ResourceNVIDIAGPU]
+		assert.Equal(t, int64(0), gpuCapacity.Value())
+		assert.Equal(t, corev1.NodeSelectorOpDoesNotExist, it.Requirements.Get(v1alpha1.LabelGKEGPUSharingStrategy).Operator())
+		assert.Error(t, it.Requirements.Compatible(sharedSelector))
+	})
+}
+
+func TestListCacheKeyCoversThreadsPerCore(t *testing.T) {
+	ctx := options.ToContext(context.Background(), &options.Options{VMMemoryOverheadPercent: 0.07})
+
+	p := newTestProvider()
+	smtOn := &v1alpha1.GCENodeClass{}
+	smtOff := &v1alpha1.GCENodeClass{Spec: v1alpha1.GCENodeClassSpec{
+		AdvancedMachineFeatures: &v1alpha1.AdvancedMachineFeatures{ThreadsPerCore: lo.ToPtr[int32](1)},
+	}}
+
+	_, err := p.List(ctx, smtOn)
+	assert.NoError(t, err)
+	_, err = p.List(ctx, smtOff)
+	assert.NoError(t, err)
+
+	assert.Equal(t, 2, p.staticInstanceTypesCache.ItemCount(),
+		"different ThreadsPerCore must produce different static cache entries")
+}
+
+func TestNewStaticInstanceTypeThreadsPerCore(t *testing.T) {
+	ctx := options.ToContext(context.Background(), &options.Options{VMMemoryOverheadPercent: 0.07})
+	mt := &computepb.MachineType{Name: lo.ToPtr("n2-standard-16"), GuestCpus: lo.ToPtr[int32](16), MemoryMb: lo.ToPtr[int32](65536)}
+
+	class := func(tpc *int32) *v1alpha1.GCENodeClass {
+		nc := &v1alpha1.GCENodeClass{}
+		if tpc != nil {
+			nc.Spec.AdvancedMachineFeatures = &v1alpha1.AdvancedMachineFeatures{ThreadsPerCore: tpc}
+		}
+		return nc
+	}
+
+	cases := []struct {
+		name string
+		tpc  *int32
+		want int64
+	}{
+		{name: "unset keeps the machine type's vCPUs", want: 16},
+		{name: "two threads keeps the machine type's vCPUs", tpc: lo.ToPtr[int32](2), want: 16},
+		{name: "one thread halves the vCPUs the guest sees", tpc: lo.ToPtr[int32](1), want: 8},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			it := NewStaticInstanceType(ctx, mt, class(tc.tpc), 0)
+			require.NotNil(t, it)
+			got := it.Capacity[corev1.ResourceCPU]
+			assert.Equal(t, tc.want, got.Value())
+		})
+	}
+
+	t.Run("kube-reserved CPU follows the visible vCPUs", func(t *testing.T) {
+		on := NewStaticInstanceType(ctx, mt, class(nil), 0)
+		off := NewStaticInstanceType(ctx, mt, class(lo.ToPtr[int32](1)), 0)
+		onReserved := on.Overhead.KubeReserved[corev1.ResourceCPU]
+		offReserved := off.Overhead.KubeReserved[corev1.ResourceCPU]
+		assert.Less(t, offReserved.MilliValue(), onReserved.MilliValue())
+	})
+
+	t.Run("a one vCPU type is not halved to zero", func(t *testing.T) {
+		tiny := &computepb.MachineType{Name: lo.ToPtr("e2-micro"), GuestCpus: lo.ToPtr[int32](1), MemoryMb: lo.ToPtr[int32](1024)}
+		it := NewStaticInstanceType(ctx, tiny, class(lo.ToPtr[int32](1)), 0)
+		got := it.Capacity[corev1.ResourceCPU]
+		assert.Equal(t, int64(1), got.Value())
+	})
+}
+
+func withBootDiskSwap(nodeClass *v1alpha1.GCENodeClass, swapGiB int64) *v1alpha1.GCENodeClass {
+	out := nodeClass.DeepCopy()
+	if nodeClass.Spec.KubeletConfiguration != nil {
+		out.Spec.KubeletConfiguration = nodeClass.Spec.KubeletConfiguration.DeepCopy()
+	}
+	out.Spec.LinuxNodeConfig = &v1alpha1.LinuxNodeConfig{SwapConfig: &v1alpha1.SwapConfig{
+		Enabled:         true,
+		BootDiskProfile: &v1alpha1.SwapBootDiskProfile{SwapSizeGib: lo.ToPtr(swapGiB)},
+	}}
+	return out
+}
+
+func automaticBootDiskSwap(nodeClass *v1alpha1.GCENodeClass) *v1alpha1.GCENodeClass {
+	out := nodeClass.DeepCopy()
+	out.Spec.LinuxNodeConfig = &v1alpha1.LinuxNodeConfig{SwapConfig: &v1alpha1.SwapConfig{Enabled: true}}
+	return out
+}
+
+func ephemeralStorageGiB(quantity resource.Quantity) int64 {
+	return quantity.Value() / (1024 * 1024 * 1024)
+}
+
+// A boot-disk swap file takes space that the kubelet would otherwise offer to
+// pods, so it is reserved from them; the node's capacity is still the disk.
+func TestNewStaticInstanceTypeReservesBootDiskSwap(t *testing.T) {
+	ctx := options.ToContext(context.Background(), &options.Options{VMMemoryOverheadPercent: 0.07})
+	n2d := &computepb.MachineType{Name: lo.ToPtr("n2d-standard-4"), GuestCpus: lo.ToPtr[int32](4), MemoryMb: lo.ToPtr[int32](16384)}
+	bootDisk := []v1alpha1.Disk{{Boot: true, SizeGiB: 200, Category: "pd-balanced"}}
+
+	for name, tc := range map[string]struct {
+		nodeClass      *v1alpha1.GCENodeClass
+		ssdCount       int
+		wantWithoutGiB int64
+		wantWithGiB    int64
+	}{
+		// 50GiB of swap leaves 150GiB for pods, whose baseline is 59GiB.
+		"boot disk holds ephemeral storage": {
+			nodeClass:      &v1alpha1.GCENodeClass{Spec: v1alpha1.GCENodeClassSpec{Disks: bootDisk}},
+			wantWithoutGiB: 76,
+			wantWithGiB:    109,
+		},
+		"kubeReserved override is kept and the swap file is added to it": {
+			nodeClass: &v1alpha1.GCENodeClass{Spec: v1alpha1.GCENodeClassSpec{Disks: bootDisk, KubeletConfiguration: &v1alpha1.KubeletConfiguration{
+				KubeReserved: map[string]v1alpha1.KubeletQuantity{"ephemeral-storage": "20Gi"},
+			}}},
+			wantWithoutGiB: 20,
+			wantWithGiB:    70,
+		},
+		"raw block Local SSDs leave ephemeral storage on the boot disk": {
+			nodeClass:      &v1alpha1.GCENodeClass{Spec: v1alpha1.GCENodeClassSpec{Disks: bootDisk, LocalSsdMode: v1alpha1.LocalSSDModeRawBlock}},
+			ssdCount:       2,
+			wantWithoutGiB: 76,
+			wantWithGiB:    109,
+		},
+		"ephemeral Local SSDs hold ephemeral storage": {
+			nodeClass:      &v1alpha1.GCENodeClass{Spec: v1alpha1.GCENodeClassSpec{Disks: bootDisk, LocalSsdMode: v1alpha1.LocalSSDModeEphemeral}},
+			ssdCount:       2,
+			wantWithoutGiB: 75,
+			// The swap file is on the boot disk, which holds no pod storage.
+			wantWithGiB: 75,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			without := NewStaticInstanceType(ctx, n2d, tc.nodeClass, tc.ssdCount)
+			with := NewStaticInstanceType(ctx, n2d, withBootDiskSwap(tc.nodeClass, 50), tc.ssdCount)
+
+			require.Equal(t, tc.wantWithoutGiB, ephemeralStorageGiB(without.Overhead.KubeReserved[corev1.ResourceEphemeralStorage]))
+			require.Equal(t, tc.wantWithGiB, ephemeralStorageGiB(with.Overhead.KubeReserved[corev1.ResourceEphemeralStorage]))
+			require.True(t, without.Capacity.StorageEphemeral().Equal(*with.Capacity.StorageEphemeral()),
+				"swap must not change the node's ephemeral storage capacity")
+		})
+	}
+}
+
+// TestNewStaticInstanceTypeBootDiskSwapAccounting pins the provider accounting
+// for a swap file on the boot disk. The baseline ephemeral-storage reservation
+// is resolved against the disk pods can use, and the swap file is then added
+// once; the eviction threshold stays on the whole disk. These are provider
+// estimates, not measured GKE runtime parity.
+func TestNewStaticInstanceTypeBootDiskSwapAccounting(t *testing.T) {
+	ctx := options.ToContext(context.Background(), &options.Options{VMMemoryOverheadPercent: 0.07})
+	n2 := &computepb.MachineType{Name: lo.ToPtr("n2-standard-4"), GuestCpus: lo.ToPtr[int32](4), MemoryMb: lo.ToPtr[int32](16384)}
+	bootDisk := func(sizeGiB int32) []v1alpha1.Disk {
+		return []v1alpha1.Disk{{Boot: true, SizeGiB: sizeGiB, Category: "pd-balanced"}}
+	}
+
+	for name, tc := range map[string]struct {
+		nodeClass        *v1alpha1.GCENodeClass
+		wantKubeReserved int64
+		wantEviction     int64
+		wantUsable       int64
+		diskGiB          int64
+	}{
+		"30GiB disk with 15GiB of swap": {
+			nodeClass:        withBootDiskSwap(&v1alpha1.GCENodeClass{Spec: v1alpha1.GCENodeClassSpec{Disks: bootDisk(30)}}, 15),
+			wantKubeReserved: 23, // 8GiB baseline on the remaining 15GiB + 15GiB swap
+			wantEviction:     3,  // 10% of the whole disk
+			wantUsable:       4,
+			diskGiB:          30,
+		},
+		"50GiB disk with 24GiB of swap": {
+			nodeClass:        withBootDiskSwap(&v1alpha1.GCENodeClass{Spec: v1alpha1.GCENodeClassSpec{Disks: bootDisk(50)}}, 24),
+			wantKubeReserved: 37, // 13GiB baseline on the remaining 26GiB + 24GiB swap
+			wantEviction:     5,
+			wantUsable:       8,
+			diskGiB:          50,
+		},
+		// The half-disk cap keeps a small disk usable: 10GiB of swap leaves
+		// 10GiB for pods, whose baseline is 5GiB, so 15GiB reserved.
+		"20GiB disk with 10GiB of swap": {
+			nodeClass:        withBootDiskSwap(&v1alpha1.GCENodeClass{Spec: v1alpha1.GCENodeClassSpec{Disks: bootDisk(20)}}, 10),
+			wantKubeReserved: 15,
+			wantEviction:     2,
+			wantUsable:       3,
+			diskGiB:          20,
+		},
+		"explicit 20Gi reservation with 4GiB of swap": {
+			nodeClass: withBootDiskSwap(&v1alpha1.GCENodeClass{Spec: v1alpha1.GCENodeClassSpec{
+				Disks: bootDisk(100),
+				KubeletConfiguration: &v1alpha1.KubeletConfiguration{
+					KubeReserved: map[string]v1alpha1.KubeletQuantity{"ephemeral-storage": "20Gi"},
+				},
+			}}, 4),
+			wantKubeReserved: 24, // the explicit reservation, then the swap file once
+			wantEviction:     10,
+			wantUsable:       66,
+			diskGiB:          100,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			it := NewStaticInstanceType(ctx, n2, tc.nodeClass, 0)
+			require.NotNil(t, it)
+
+			require.Equal(t, tc.wantKubeReserved, ephemeralStorageGiB(it.Overhead.KubeReserved[corev1.ResourceEphemeralStorage]))
+			require.Equal(t, tc.wantEviction, ephemeralStorageGiB(it.Overhead.EvictionThreshold[corev1.ResourceEphemeralStorage]))
+			require.Equal(t, tc.diskGiB, ephemeralStorageGiB(it.Capacity[corev1.ResourceEphemeralStorage]),
+				"the swap file does not change the node's capacity")
+
+			usable := ephemeralStorageGiB(it.Capacity[corev1.ResourceEphemeralStorage]) -
+				ephemeralStorageGiB(it.Overhead.KubeReserved[corev1.ResourceEphemeralStorage]) -
+				ephemeralStorageGiB(it.Overhead.EvictionThreshold[corev1.ResourceEphemeralStorage])
+			require.Equal(t, tc.wantUsable, usable)
+			require.Positive(t, usable)
+		})
+	}
+}
+
+// TestNewStaticInstanceTypeBootDiskSwapAutomaticSizing checks that the automatic
+// size follows each machine's own memory and that the provider materializes the
+// default boot disk it estimates with. The baseline reservations are fixed
+// values from the documented GKE reservation policy, not recomputed here.
+func TestNewStaticInstanceTypeBootDiskSwapAutomaticSizing(t *testing.T) {
+	ctx := options.ToContext(context.Background(), &options.Options{VMMemoryOverheadPercent: 0.07})
+	nodeClass := automaticBootDiskSwap(&v1alpha1.GCENodeClass{})
+
+	for name, tc := range map[string]struct {
+		machineType  *computepb.MachineType
+		wantBaseline int64
+		wantSwapGiB  int64
+	}{
+		// A 4GiB swap file leaves 96GiB for pods, whose baseline is 40GiB.
+		"2GiB machine gets a 4GiB swap file": {
+			machineType:  &computepb.MachineType{Name: lo.ToPtr("n2-standard-2"), GuestCpus: lo.ToPtr[int32](2), MemoryMb: lo.ToPtr[int32](2048)},
+			wantBaseline: 40,
+			wantSwapGiB:  4,
+		},
+		// A 16GiB swap file leaves 84GiB, whose baseline is 35GiB.
+		"8GiB machine gets a 16GiB swap file": {
+			machineType:  &computepb.MachineType{Name: lo.ToPtr("n2-standard-2"), GuestCpus: lo.ToPtr[int32](2), MemoryMb: lo.ToPtr[int32](8192)},
+			wantBaseline: 35,
+			wantSwapGiB:  16,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			it := NewStaticInstanceType(ctx, tc.machineType, nodeClass, 0)
+			require.NotNil(t, it)
+			require.Equal(t, int64(100), ephemeralStorageGiB(it.Capacity[corev1.ResourceEphemeralStorage]),
+				"swap nodes without a configured boot disk use the provider's default boot disk")
+			require.Equal(t, tc.wantBaseline+tc.wantSwapGiB,
+				ephemeralStorageGiB(it.Overhead.KubeReserved[corev1.ResourceEphemeralStorage]))
+		})
+	}
+}
+
+// TestNewStaticInstanceTypeSkipsUnlaunchableBootDiskSwapCandidates protects the
+// scheduler from advertising a machine whose swap file the provider cannot size
+// or place.
+func TestNewStaticInstanceTypeSkipsUnlaunchableBootDiskSwapCandidates(t *testing.T) {
+	ctx := options.ToContext(context.Background(), &options.Options{VMMemoryOverheadPercent: 0.07})
+	tiny := &computepb.MachineType{Name: lo.ToPtr("n2-standard-2"), GuestCpus: lo.ToPtr[int32](2), MemoryMb: lo.ToPtr[int32](1023)}
+	n2 := &computepb.MachineType{Name: lo.ToPtr("n2-standard-4"), GuestCpus: lo.ToPtr[int32](4), MemoryMb: lo.ToPtr[int32](16384)}
+	unknownFamily := &computepb.MachineType{Name: lo.ToPtr("madeup-standard-4"), GuestCpus: lo.ToPtr[int32](4), MemoryMb: lo.ToPtr[int32](16384)}
+
+	require.Nil(t, NewStaticInstanceType(ctx, tiny, automaticBootDiskSwap(&v1alpha1.GCENodeClass{}), 0),
+		"memory below 1GiB cannot produce a positive automatic size")
+	require.Nil(t, NewStaticInstanceType(ctx, unknownFamily, automaticBootDiskSwap(&v1alpha1.GCENodeClass{}), 0),
+		"a family without disk compatibility cannot get a default boot disk")
+
+	oversize := withBootDiskSwap(&v1alpha1.GCENodeClass{Spec: v1alpha1.GCENodeClassSpec{
+		Disks: []v1alpha1.Disk{{Boot: true, SizeGiB: 20}},
+	}}, 11)
+	require.Nil(t, NewStaticInstanceType(ctx, n2, oversize, 0), "an oversize swap file must not be scheduled")
+
+	// The same machines still schedule without swap, so the filter applies to
+	// the swap configuration rather than to the machine.
+	require.NotNil(t, NewStaticInstanceType(ctx, tiny, &v1alpha1.GCENodeClass{}, 0))
+	require.NotNil(t, NewStaticInstanceType(ctx, n2, &v1alpha1.GCENodeClass{}, 0))
+}
+
+func TestListCacheKeyCoversBootDiskSwap(t *testing.T) {
+	ctx := options.ToContext(context.Background(), &options.Options{VMMemoryOverheadPercent: 0.07})
+	p := newTestProvider()
+	base := &v1alpha1.GCENodeClass{Spec: v1alpha1.GCENodeClassSpec{
+		Disks: []v1alpha1.Disk{{Boot: true, SizeGiB: 200, Category: "hyperdisk-balanced"}},
+	}}
+
+	reserved := func(nodeClass *v1alpha1.GCENodeClass) int64 {
+		its, err := p.List(ctx, nodeClass)
+		require.NoError(t, err)
+		require.NotEmpty(t, its)
+		return ephemeralStorageGiB(its[0].Overhead.KubeReserved[corev1.ResourceEphemeralStorage])
+	}
+
+	small, large, automatic := withBootDiskSwap(base, 1), withBootDiskSwap(base, 50), automaticBootDiskSwap(base)
+	smallReserved, largeReserved, automaticReserved := reserved(small), reserved(large), reserved(automatic)
+
+	require.NotEqual(t, smallReserved, largeReserved, "a different explicit swap size must not reuse the cached reservation")
+	require.NotEqual(t, smallReserved, automaticReserved, "an automatic size must not reuse an explicit size's reservation")
+	require.Equal(t, smallReserved, reserved(small), "one configuration keeps returning its own reservation")
 }

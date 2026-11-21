@@ -19,6 +19,7 @@ import (
 	stderrors "errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"time"
 
 	"github.com/awslabs/operatorpkg/status"
@@ -32,16 +33,20 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/controllers/nodeoverlay"
 	"sigs.k8s.io/karpenter/pkg/events"
+	karpoptions "sigs.k8s.io/karpenter/pkg/operator/options"
 	"sigs.k8s.io/karpenter/pkg/scheduling"
 	"sigs.k8s.io/karpenter/pkg/utils/resources"
 
 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/apis/v1alpha1"
 	cloudproviderevents "github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/cloudprovider/events"
 	gcperrors "github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/errors"
+	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/providers/imagefamily"
 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/providers/instance"
 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/providers/instancetype"
 	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/utils"
+	"github.com/cloudpilot-ai/karpenter-provider-gcp/pkg/utils/localssd"
 )
 
 const CloudProviderName = "gcp"
@@ -59,18 +64,21 @@ type CloudProvider struct {
 
 	instanceTypeProvider instancetype.Provider
 	instanceProvider     instance.Provider
+	instanceTypeStore    *nodeoverlay.InstanceTypeStore
 }
 
 func New(kubeClient client.Client,
 	recorder events.Recorder,
 	instanceTypeProvider instancetype.Provider,
 	instanceProvider instance.Provider,
+	store *nodeoverlay.InstanceTypeStore,
 ) *CloudProvider {
 	return &CloudProvider{
 		kubeClient:           kubeClient,
 		recorder:             recorder,
 		instanceTypeProvider: instanceTypeProvider,
 		instanceProvider:     instanceProvider,
+		instanceTypeStore:    store,
 	}
 }
 
@@ -85,36 +93,83 @@ func (c *CloudProvider) Create(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 	}
 
 	nodeClassReady := nodeClass.StatusConditions().Get(status.ConditionReady)
+	var readinessErr error
 	if nodeClassReady.IsFalse() {
-		return nil, cloudprovider.NewNodeClassNotReadyError(stderrors.New(nodeClassReady.Message))
+		readinessErr = cloudprovider.NewNodeClassNotReadyError(stderrors.New(nodeClassReady.Message))
+	} else if nodeClassReady.IsUnknown() {
+		readinessErr = cloudprovider.NewCreateError(fmt.Errorf("resolving NodeClass readiness, NodeClass is in Ready=Unknown, %s", nodeClassReady.Message), "NodeClassReadinessUnknown", "NodeClass is in Ready=Unknown")
 	}
-	if nodeClassReady.IsUnknown() {
-		return nil, cloudprovider.NewCreateError(fmt.Errorf("resolving NodeClass readiness, NodeClass is in Ready=Unknown, %s", nodeClassReady.Message), "NodeClassReadinessUnknown", "NodeClass is in Ready=Unknown")
+	if readinessErr != nil && nodeClass.StatusConditions().IsTrue(v1alpha1.ConditionTypeImagesReady) {
+		return nil, readinessErr
 	}
 
-	instanceTypes, err := c.resolveInstanceTypes(ctx, nodeClaim, nodeClass)
+	var inst *instance.Instance
+	var instanceTypes []*cloudprovider.InstanceType
+	if readinessErr != nil {
+		// Adopt cannot launch or depend on current image/offerings availability.
+		inst, err = c.instanceProvider.Adopt(ctx, nodeClaim)
+		if err != nil {
+			return nil, fmt.Errorf("adopting instance, %w", err)
+		}
+		if inst == nil {
+			return nil, readinessErr
+		}
+		instanceTypes, err = c.instanceTypeProvider.List(ctx, nodeClass)
+		if err != nil {
+			return nil, cloudprovider.NewCreateError(fmt.Errorf("resolving adopted instance type, %w", err), "InstanceTypeResolutionFailed", "Error resolving adopted instance type")
+		}
+	} else {
+		instanceTypes, err = c.resolveInstanceTypes(ctx, nodeClaim, nodeClass)
+		if err != nil {
+			return nil, cloudprovider.NewCreateError(fmt.Errorf("resolving instance types, %w", err), "InstanceTypeResolutionFailed", "Error resolving instance types")
+		}
+		if len(instanceTypes) == 0 {
+			return nil, cloudprovider.NewInsufficientCapacityError(fmt.Errorf("all requested instance types were unavailable during launch"))
+		}
+		inst, err = c.instanceProvider.Create(ctx, nodeClass, nodeClaim, instanceTypes)
+		if err != nil {
+			return nil, fmt.Errorf("creating instance, %w", err)
+		}
+	}
+
+	instanceType, err := c.resolveCreatedInstanceType(ctx, nodeClass, instanceTypes, inst)
 	if err != nil {
-		return nil, cloudprovider.NewCreateError(fmt.Errorf("resolving instance types, %w", err), "InstanceTypeResolutionFailed", "Error resolving instance types")
+		return nil, err
 	}
-	if len(instanceTypes) == 0 {
-		return nil, cloudprovider.NewInsufficientCapacityError(fmt.Errorf("all requested instance types were unavailable during launch"))
+	if readinessErr != nil && instanceType != nil && karpoptions.FromContext(ctx).FeatureGates.NodeOverlay {
+		if nodePoolName, ok := nodeClaim.Labels[karpv1.NodePoolLabelKey]; ok {
+			instanceType, err = c.instanceTypeStore.Apply(nodePoolName, instanceType)
+			if err != nil {
+				return nil, fmt.Errorf("applying nodeoverlays, %w", err)
+			}
+		}
 	}
 
-	instance, err := c.instanceProvider.Create(ctx, nodeClass, nodeClaim, instanceTypes)
-	if err != nil {
-		return nil, fmt.Errorf("creating instance, %w", err)
-	}
-
-	instanceType, _ := lo.Find(instanceTypes, func(i *cloudprovider.InstanceType) bool {
-		return i.Name == instance.Type
-	})
-
-	nc := c.instanceToNodeClaim(instance, instanceType)
+	nc := c.instanceToNodeClaim(inst, instanceType)
 	nc.Annotations = lo.Assign(nc.Annotations, map[string]string{
 		v1alpha1.AnnotationGCENodeClassHash:        nodeClass.Hash(),
 		v1alpha1.AnnotationGCENodeClassHashVersion: v1alpha1.GCENodeClassHashVersion,
 	})
 	return nc, nil
+}
+
+func (c *CloudProvider) resolveCreatedInstanceType(ctx context.Context, nodeClass *v1alpha1.GCENodeClass, instanceTypes []*cloudprovider.InstanceType, inst *instance.Instance) (*cloudprovider.InstanceType, error) {
+	instanceType, _ := matchVariantForInstance(instanceTypes, inst)
+	count, stamped := inst.Labels[utils.SanitizeGCELabelValue(v1alpha1.LabelInstanceLocalSsdCount)]
+	if !stamped || (instanceType != nil && instanceType.Requirements.Get(v1alpha1.LabelInstanceLocalSsdCount).Any() == count) {
+		return instanceType, nil
+	}
+
+	// An adopted VM can outlive a NodeClass change that filtered its variant out of launch candidates.
+	allInstanceTypes, err := c.instanceTypeProvider.List(ctx, nodeClass)
+	if err != nil {
+		return nil, cloudprovider.NewCreateError(fmt.Errorf("resolving adopted instance type, %w", err), "InstanceTypeResolutionFailed", "Error resolving adopted instance type")
+	}
+	instanceType, _ = matchVariantForInstance(allInstanceTypes, inst)
+	if instanceType == nil || instanceType.Requirements.Get(v1alpha1.LabelInstanceLocalSsdCount).Any() != count {
+		return nil, cloudprovider.NewCreateError(fmt.Errorf("instance %s has local SSD count %q without a matching variant for %s", inst.Name, count, inst.Type), "LocalSSDCountMismatch", "Existing instance local SSD count has no matching variant")
+	}
+	return instanceType, nil
 }
 
 func (c *CloudProvider) List(ctx context.Context) ([]*karpv1.NodeClaim, error) {
@@ -146,19 +201,48 @@ func (c *CloudProvider) resolveInstanceTypeFromInstance(ctx context.Context, ins
 		return nil, client.IgnoreNotFound(fmt.Errorf("resolving nodepool, %w", err))
 	}
 
-	instanceTypes, err := c.GetInstanceTypes(ctx, nodePool)
+	instanceTypes, err := c.getAllInstanceTypes(ctx, nodePool)
 	if err != nil {
 		return nil, client.IgnoreNotFound(fmt.Errorf("getting instance types, %w", err))
 	}
 
-	instanceType, ok := lo.Find(instanceTypes, func(i *cloudprovider.InstanceType) bool {
-		return i.Name == instance.Type
-	})
-
+	instanceType, ok := matchVariantForInstance(instanceTypes, instance)
 	if !ok {
-		return nil, fmt.Errorf("instance type %s not found in offerings", instance.Type)
+		// Catalog membership controls new launches, not whether existing VMs can be
+		// discovered and garbage-collected after their registration is removed.
+		return nil, nil
+	}
+	if karpoptions.FromContext(ctx).FeatureGates.NodeOverlay {
+		instanceType, err = c.instanceTypeStore.Apply(nodePool.Name, instanceType)
+		if err != nil {
+			return nil, fmt.Errorf("applying nodeoverlays, %w", err)
+		}
 	}
 	return instanceType, nil
+}
+
+// matchVariantForInstance disambiguates same-name instance types using the
+// local-SSD count stamped on the VM. Unlabeled VMs use the first name match.
+func matchVariantForInstance(its []*cloudprovider.InstanceType, inst *instance.Instance) (*cloudprovider.InstanceType, bool) {
+	gceCountKey := utils.SanitizeGCELabelValue(v1alpha1.LabelInstanceLocalSsdCount)
+	wantCount, hasCount := inst.Labels[gceCountKey]
+	var fallback *cloudprovider.InstanceType
+	for _, i := range its {
+		if i.Name != inst.Type {
+			continue
+		}
+		if fallback == nil {
+			fallback = i
+		}
+		if !hasCount {
+			return i, true
+		}
+		req := i.Requirements.Get(v1alpha1.LabelInstanceLocalSsdCount)
+		if req.Operator() == corev1.NodeSelectorOpIn && req.Len() == 1 && req.Any() == wantCount {
+			return i, true
+		}
+	}
+	return fallback, fallback != nil
 }
 
 func (c *CloudProvider) resolveNodePoolFromInstance(ctx context.Context, instance *instance.Instance) (*karpv1.NodePool, error) {
@@ -196,7 +280,9 @@ func (c *CloudProvider) LivenessProbe(req *http.Request) error {
 	return c.instanceTypeProvider.LivenessProbe(req)
 }
 
-// GetInstanceTypes returns all available InstanceTypes
+// GetInstanceTypes serves scheduling and running-node drift checks. Types without a usable
+// image retain their offering requirements for drift checks, but cannot supply new capacity.
+// Non-zero configurable SSD counts still require the count label on the NodePool.
 func (c *CloudProvider) GetInstanceTypes(ctx context.Context, nodePool *karpv1.NodePool) ([]*cloudprovider.InstanceType, error) {
 	nodeClass, err := c.resolveNodeClassFromNodePool(ctx, nodePool)
 	if err != nil {
@@ -215,7 +301,42 @@ func (c *CloudProvider) GetInstanceTypes(ctx context.Context, nodePool *karpv1.N
 	if err != nil {
 		return nil, err
 	}
-	return instanceTypes, nil
+	instanceTypes = instanceTypesForScheduling(nodePool, instanceTypes)
+	return lo.Map(instanceTypes, func(it *cloudprovider.InstanceType, _ int) *cloudprovider.InstanceType {
+		if nodeClass.StatusConditions().IsTrue(v1alpha1.ConditionTypeImagesReady) {
+			if _, ok := imagefamily.FindImage(nodeClass.Status.Images, it.Requirements); ok {
+				return it
+			}
+		}
+		unavailable := it.DeepCopy()
+		for _, offering := range unavailable.Offerings {
+			offering.Available = false
+		}
+		return unavailable
+	}), nil
+}
+
+func (c *CloudProvider) getAllInstanceTypes(ctx context.Context, nodePool *karpv1.NodePool) ([]*cloudprovider.InstanceType, error) {
+	nodeClass, err := c.resolveNodeClassFromNodePool(ctx, nodePool)
+	if err != nil {
+		return nil, err
+	}
+	return c.instanceTypeProvider.List(ctx, nodeClass)
+}
+
+func instanceTypesForScheduling(nodePool *karpv1.NodePool, instanceTypes []*cloudprovider.InstanceType) []*cloudprovider.InstanceType {
+	requirements := scheduling.NewNodeSelectorRequirementsWithMinValues(nodePool.Spec.Template.Spec.Requirements...)
+	requirements.Add(scheduling.NewLabelRequirements(nodePool.Spec.Template.Labels).Values()...)
+	if requirements.Has(v1alpha1.LabelInstanceLocalSsdCount) {
+		return slices.Clone(instanceTypes)
+	}
+	return lo.Filter(instanceTypes, func(instanceType *cloudprovider.InstanceType, _ int) bool {
+		if !localssd.FamilySupportsConfigurableLocalSSDs(instanceType.Name) {
+			return true
+		}
+		count := instanceType.Requirements.Get(v1alpha1.LabelInstanceLocalSsdCount)
+		return count.Operator() == corev1.NodeSelectorOpIn && count.Len() == 1 && count.Any() == "0"
+	})
 }
 
 func (c *CloudProvider) resolveNodeClassFromNodePool(ctx context.Context, nodePool *karpv1.NodePool) (*v1alpha1.GCENodeClass, error) {
@@ -237,6 +358,10 @@ func (c *CloudProvider) Delete(ctx context.Context, nodeClaim *karpv1.NodeClaim)
 	}
 	ctx = log.IntoContext(ctx, log.FromContext(ctx).WithValues("id", providerID))
 	return c.instanceProvider.Delete(ctx, providerID)
+}
+
+func (c *CloudProvider) Reboot(_ context.Context, _ *karpv1.NodeClaim, _ string) error {
+	return cloudprovider.NewNodeRebootNotImplementedError()
 }
 
 func (c *CloudProvider) IsDrifted(ctx context.Context, nodeClaim *karpv1.NodeClaim) (cloudprovider.DriftReason, error) {
@@ -265,7 +390,8 @@ func (c *CloudProvider) IsDrifted(ctx context.Context, nodeClaim *karpv1.NodeCla
 	return c.isNodeClassDrifted(ctx, nodeClaim, nodePool, nodeClass), nil
 }
 
-// RepairPolicies returns the node health conditions that trigger node replacement.
+// RepairPolicies preserves forceful replacement for supported unhealthy conditions.
+// Modern repair still respects disruption budgets and replacement-capacity checks.
 // Polarity on GKE differs by source:
 //   - kubelet conditions (NodeReady, etc.): False/Unknown = problem
 //   - Node Problem Detector conditions (KernelDeadlock, etc.): True = problem
@@ -273,40 +399,58 @@ func (c *CloudProvider) RepairPolicies() []cloudprovider.RepairPolicy {
 	return []cloudprovider.RepairPolicy{
 		// Standard kubelet conditions — NodeReady=False/Unknown means the node is unresponsive.
 		{
-			ConditionType:      corev1.NodeReady,
-			ConditionStatus:    corev1.ConditionFalse,
-			TolerationDuration: 10 * time.Minute,
+			ConditionType:          corev1.NodeReady,
+			ConditionStatus:        corev1.ConditionFalse,
+			ReasonRegex:            ".*",
+			TolerationDuration:     10 * time.Minute,
+			TerminationGracePeriod: lo.ToPtr(time.Duration(0)),
+			Action:                 cloudprovider.ReplaceNode,
 		},
 		{
-			ConditionType:      corev1.NodeReady,
-			ConditionStatus:    corev1.ConditionUnknown,
-			TolerationDuration: 10 * time.Minute,
+			ConditionType:          corev1.NodeReady,
+			ConditionStatus:        corev1.ConditionUnknown,
+			ReasonRegex:            ".*",
+			TolerationDuration:     10 * time.Minute,
+			TerminationGracePeriod: lo.ToPtr(time.Duration(0)),
+			Action:                 cloudprovider.ReplaceNode,
 		},
 		// GKE Node Problem Detector — kernel-monitor conditions (enabled by default on all node pools).
 		// KernelDeadlock and ReadonlyFilesystem are unrecoverable OS failures.
 		{
-			ConditionType:      "KernelDeadlock",
-			ConditionStatus:    corev1.ConditionTrue,
-			TolerationDuration: 5 * time.Minute,
+			ConditionType:          "KernelDeadlock",
+			ConditionStatus:        corev1.ConditionTrue,
+			ReasonRegex:            ".*",
+			TolerationDuration:     5 * time.Minute,
+			TerminationGracePeriod: lo.ToPtr(time.Duration(0)),
+			Action:                 cloudprovider.ReplaceNode,
 		},
 		{
-			ConditionType:      "ReadonlyFilesystem",
-			ConditionStatus:    corev1.ConditionTrue,
-			TolerationDuration: 5 * time.Minute,
+			ConditionType:          "ReadonlyFilesystem",
+			ConditionStatus:        corev1.ConditionTrue,
+			ReasonRegex:            ".*",
+			TolerationDuration:     5 * time.Minute,
+			TerminationGracePeriod: lo.ToPtr(time.Duration(0)),
+			Action:                 cloudprovider.ReplaceNode,
 		},
 		// GKE Node Problem Detector — restart-monitor conditions. Longer toleration
 		// lets transient restarts self-heal before triggering replacement.
 		// FrequentDockerRestart is intentionally omitted: GKE node pools use containerd
 		// since GKE 1.24 and Docker is no longer shipped on standard node images.
 		{
-			ConditionType:      "FrequentKubeletRestart",
-			ConditionStatus:    corev1.ConditionTrue,
-			TolerationDuration: 30 * time.Minute,
+			ConditionType:          "FrequentKubeletRestart",
+			ConditionStatus:        corev1.ConditionTrue,
+			ReasonRegex:            ".*",
+			TolerationDuration:     30 * time.Minute,
+			TerminationGracePeriod: lo.ToPtr(time.Duration(0)),
+			Action:                 cloudprovider.ReplaceNode,
 		},
+		// Core requires one reason-independent fallback for supported condition/status pairs.
 		{
-			ConditionType:      "FrequentContainerdRestart",
-			ConditionStatus:    corev1.ConditionTrue,
-			TolerationDuration: 30 * time.Minute,
+			ConditionType:          "FrequentContainerdRestart",
+			ConditionStatus:        corev1.ConditionTrue,
+			TolerationDuration:     30 * time.Minute,
+			TerminationGracePeriod: lo.ToPtr(time.Duration(0)),
+			Action:                 cloudprovider.ReplaceNode,
 		},
 	}
 }
@@ -334,17 +478,15 @@ func (c *CloudProvider) instanceToNodeClaim(i *instance.Instance, instanceType *
 
 		nodeClaim.Status.Capacity = lo.PickBy(instanceType.Capacity, resourceFilter)
 		nodeClaim.Status.Allocatable = lo.PickBy(instanceType.Allocatable(), resourceFilter)
-
-		// Add instance type label for gce nodeclaim
-		labels[corev1.LabelInstanceTypeStable] = instanceType.Name
 	}
 
-	// Set core labels
+	// Identity comes from the VM even when its type is no longer in the catalog.
+	labels[corev1.LabelInstanceTypeStable] = i.Type
 	labels[corev1.LabelTopologyZone] = i.Location
 	labels[karpv1.CapacityTypeLabelKey] = i.CapacityType
 
 	// Add node pool label if present
-	if v, ok := i.Labels[karpv1.NodePoolLabelKey]; ok {
+	if v, ok := i.Labels[utils.SanitizeGCELabelValue(utils.LabelNodePoolKey)]; ok {
 		labels[karpv1.NodePoolLabelKey] = v
 	}
 
@@ -389,6 +531,14 @@ func (c *CloudProvider) resolveInstanceTypes(ctx context.Context, nodeClaim *kar
 	instanceTypes, err := c.instanceTypeProvider.List(ctx, nodeClass)
 	if err != nil {
 		return nil, err
+	}
+	if karpoptions.FromContext(ctx).FeatureGates.NodeOverlay {
+		if nodePoolName, ok := nodeClaim.Labels[karpv1.NodePoolLabelKey]; ok {
+			instanceTypes, err = c.instanceTypeStore.ApplyAll(nodePoolName, instanceTypes)
+			if err != nil {
+				return nil, fmt.Errorf("applying nodeoverlays, %w", err)
+			}
+		}
 	}
 
 	reqs := scheduling.NewNodeSelectorRequirementsWithMinValues(nodeClaim.Spec.Requirements...)

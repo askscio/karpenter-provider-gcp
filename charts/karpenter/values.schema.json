@@ -38,7 +38,12 @@
     "additionalAnnotations": {
       "type": "object",
       "additionalProperties": { "type": "string" },
-      "description": "Additional annotations added to all resources."
+      "description": "Additional annotations to add into metadata for templated resources (excludes CRDs)"
+    },
+    "additionalLabels": {
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "description": "Additional labels to add into metadata for templated resources (excludes CRDs). Labels that the chart adds by default will not be overridden by these additional labels."
     },
     "imagePullSecrets": {
       "type": "array",
@@ -308,6 +313,26 @@
               "type": "boolean",
               "description": "Enable scheduling to reserved/committed GCP capacity. Disabled by default: GCE reservation support is not yet implemented (see #239).",
               "default": false
+            },
+            "capacityBuffer": {
+              "type": "boolean",
+              "description": "Enable CapacityBuffer support (alpha) for pre-provisioning spare capacity.",
+              "default": false
+            },
+            "terminateFirstDrift": {
+              "type": "boolean",
+              "description": "Allow drift to terminate before replacement on capacity-constrained NodePools (alpha).",
+              "default": false
+            },
+            "terminateFirstRepair": {
+              "type": "boolean",
+              "description": "Allow repair to terminate before replacement on capacity-constrained NodePools (alpha). Only effective with nodeRepair enabled and legacyNodeRepair disabled.",
+              "default": false
+            },
+            "podDeletionCostManagement": {
+              "type": "boolean",
+              "description": "Manage pod-deletion-cost annotations for ReplicaSet scale-down (alpha).",
+              "default": false
             }
           }
         },
@@ -323,6 +348,11 @@
         "tolerations": {
           "type": "array",
           "description": "Tolerations for the controller pod.",
+          "items": { "type": "object" }
+        },
+        "topologySpreadConstraints": {
+          "type": "array",
+          "description": "Topology spread constraints for the controller pod.",
           "items": { "type": "object" }
         },
         "settings": {
@@ -368,6 +398,35 @@
               "description": "When true, Karpenter ignores pods' Dynamic Resource Allocation requests during scheduling simulations.",
               "default": true
             },
+            "legacyNodeRepair": {
+              "type": "boolean",
+              "description": "Use the legacy forceful node repair controller when nodeRepair is enabled. Terminate-first repair is ignored in this mode.",
+              "default": false
+            },
+            "schedulerConfig": {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "Optional scheduler behavior to mirror. Core validates topology spread constraints at startup.",
+              "default": {},
+              "properties": {
+                "podTopologySpread": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "defaultConstraints": {
+                      "type": "array",
+                      "items": { "type": "object" }
+                    }
+                  }
+                }
+              }
+            },
+            "preferencePolicy": {
+              "type": "string",
+              "enum": ["Respect", "Ignore"],
+              "description": "How Karpenter handles soft scheduling preferences. Respect preserves them; Ignore disregards preferred node/pod affinity and anti-affinity plus ScheduleAnyway topology spread constraints.",
+              "default": "Respect"
+            },
             "defaultNodePoolTemplateName": {
               "type": "string",
               "description": "Pin the GKE node pool used as the bootstrap metadata source. Leave empty for automatic discovery.",
@@ -377,8 +436,49 @@
               "type": "string",
               "description": "Default GCP service account email to attach to provisioned nodes. Overrides the Compute Engine default SA. Leave empty to use the Compute Engine default SA.",
               "default": ""
+            },
+            "quotaExceededTTL": {
+              "type": "string",
+              "description": "How long an instance type stays unavailable in the region after a QUOTA_EXCEEDED launch failure (e.g. 1h). Leave empty for the controller default of 30m; 0s disables quota backoff.",
+              "default": ""
+            },
+            "telemetry": {
+              "type": "boolean",
+              "description": "Send anonymized resource totals and Spot interruption events to CloudPilot AI. See docs/settings.md#telemetry for exactly what is sent.",
+              "default": false
+            },
+            "stockoutTTL": {
+              "type": "string",
+              "description": "How long an instance type, zone and capacity type stays unavailable after a launch fails with ZONE_RESOURCE_POOL_EXHAUSTED (e.g. 2m). Leave empty for the controller default of 5m. Must be positive.",
+              "default": ""
+            },
+            "ipSpaceExhaustedTTL": {
+              "type": "string",
+              "description": "How long an instance type, zone and capacity type stays unavailable after a launch fails with IP_SPACE_EXHAUSTED on every pod range (e.g. 1m). Leave empty for the controller default of 30s. Must be positive.",
+              "default": ""
+            },
+            "unsupportedConfigurationTTL": {
+              "type": "string",
+              "description": "How long an instance type, zone and capacity type stays unavailable after GCE reports the zone does not support the requested configuration (e.g. 6h). Leave empty for the controller default of 1h. Must be positive.",
+              "default": ""
+            },
+            "launchTimeout": {
+              "type": "string",
+              "description": "How long a NodeClaim may keep failing to launch with a non-capacity error before it is deleted and replaced (e.g. 10m). Leave empty for the controller default of 5m. Must be positive.",
+              "default": ""
             }
           }
+        }
+      }
+    },
+    "node-problem-detector": {
+      "type": "object",
+      "description": "Values passed to the optional node-problem-detector subchart that runs the Spot preemption plugin. Schema is owned by that chart; only the enable toggle is constrained here.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Deploy node-problem-detector with the Spot preemption plugin.",
+          "default": false
         }
       }
     },
