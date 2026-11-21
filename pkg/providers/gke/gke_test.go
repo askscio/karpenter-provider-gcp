@@ -92,41 +92,14 @@ func TestGetServerConfig_CacheHit(t *testing.T) {
 	require.Equal(t, int32(1), calls.Load(), "second call must hit cache")
 }
 
-func TestResolveClusterZones_UsesClusterLocations(t *testing.T) {
-	var calls atomic.Int32
+func TestResolveClusterZones_UsesAllRegionalZonesForZonalCluster(t *testing.T) {
+	var computeCalls atomic.Int32
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls.Add(1)
-		resp := &containerv1.Cluster{
-			Name:      "test-cluster",
-			Location:  "europe-west4-a",
-			Locations: []string{"europe-west4-c", "europe-west4-a"},
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(resp)
-	}))
-	defer srv.Close()
-
-	p := newTestProvider(t, srv.URL, "europe-west4-a")
-
-	zones, err := p.ResolveClusterZones(context.Background())
-	require.NoError(t, err)
-	require.Equal(t, []string{"europe-west4-a", "europe-west4-c"}, zones)
-	require.Equal(t, int32(1), calls.Load())
-
-	zones, err = p.ResolveClusterZones(context.Background())
-	require.NoError(t, err)
-	require.Equal(t, []string{"europe-west4-a", "europe-west4-c"}, zones)
-	require.Equal(t, int32(1), calls.Load(), "second call must hit cache")
-}
-
-func TestResolveClusterZones_FallsBackToRegionZonesWhenClusterLocationsEmpty(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
-		case "/v1/projects/p/locations/europe-west4-a/clusters/test-cluster":
-			_ = json.NewEncoder(w).Encode(&containerv1.Cluster{Name: "test-cluster", Location: "europe-west4-a"})
 		case "/projects/p/zones":
+			computeCalls.Add(1)
 			_ = json.NewEncoder(w).Encode(&computev1.ZoneList{Items: []*computev1.Zone{
 				{Name: "europe-west4-c"},
 				{Name: "europe-west4-a"},
@@ -144,6 +117,39 @@ func TestResolveClusterZones_FallsBackToRegionZonesWhenClusterLocationsEmpty(t *
 	zones, err := p.ResolveClusterZones(ctx)
 	require.NoError(t, err)
 	require.Equal(t, []string{"europe-west4-a", "europe-west4-c"}, zones)
+	require.Equal(t, int32(1), computeCalls.Load())
+
+	zones, err = p.ResolveClusterZones(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []string{"europe-west4-a", "europe-west4-c"}, zones)
+	require.Equal(t, int32(1), computeCalls.Load(), "second call must hit cache")
+}
+
+func TestResolveClusterZones_UsesAllRegionalZonesForRegionalCluster(t *testing.T) {
+	var computeCalls atomic.Int32
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path != "/projects/p/zones" {
+			http.NotFound(w, r)
+			return
+		}
+		computeCalls.Add(1)
+		_ = json.NewEncoder(w).Encode(&computev1.ZoneList{Items: []*computev1.Zone{
+			{Name: "europe-west4-c"},
+			{Name: "europe-west4-a"},
+			{Name: "us-central1-a"},
+		}})
+	}))
+	defer srv.Close()
+
+	p := newTestProvider(t, srv.URL, "europe-west4")
+	ctx := options.ToContext(context.Background(), &options.Options{ProjectID: "p", ClusterLocation: "europe-west4"})
+
+	zones, err := p.ResolveClusterZones(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []string{"europe-west4-a", "europe-west4-c"}, zones)
+	require.Equal(t, int32(1), computeCalls.Load())
 }
 
 func newTestProvider(t *testing.T, endpoint, nodeLocation string) *DefaultProvider {
